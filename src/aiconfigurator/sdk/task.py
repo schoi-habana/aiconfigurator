@@ -518,21 +518,27 @@ class TaskConfigFactory:
             fp8_gemm_quant = "fp8_block"
             fp8_fhma_quant = "fp8"
 
-        if sm_version >= 100:
-            gemm_quant_mode = "nvfp4"
-            moe_quant_mode = "nvfp4"
-            kvcache_quant_mode = "fp8"
-            fmha_quant_mode = fp8_fhma_quant
-        elif sm_version >= 89:
-            gemm_quant_mode = fp8_gemm_quant
-            moe_quant_mode = fp8_gemm_quant
-            fmha_quant_mode = fp8_fhma_quant
-            kvcache_quant_mode = "fp8"
+        if sm_version:
+            if sm_version >= 100:
+                gemm_quant_mode = "nvfp4"
+                moe_quant_mode = "nvfp4"
+                kvcache_quant_mode = "fp8"
+                fmha_quant_mode = fp8_fhma_quant
+            elif sm_version >= 89:
+                gemm_quant_mode = fp8_gemm_quant
+                moe_quant_mode = fp8_gemm_quant
+                fmha_quant_mode = fp8_fhma_quant
+                kvcache_quant_mode = "fp8"
+            else:
+                gemm_quant_mode = "float16"
+                moe_quant_mode = "float16"
+                kvcache_quant_mode = "float16"
+                fmha_quant_mode = "float16"
         else:
-            gemm_quant_mode = "float16"
-            moe_quant_mode = "float16"
-            kvcache_quant_mode = "float16"
-            fmha_quant_mode = "float16"
+            gemm_quant_mode = "bfloat16"
+            moe_quant_mode = "bfloat16"
+            kvcache_quant_mode = "bfloat16"
+            fmha_quant_mode = "bfloat16"
 
         if model_name in ["DEEPSEEK_V3", "KIMI_K2"]:
             fmha_quant_mode = "float16"

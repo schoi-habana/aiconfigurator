@@ -33,7 +33,18 @@ from typing import Optional
 import torch
 
 from helper import log_perf
+import time
 
+import habana_frameworks.torch.utils.experimental as htexp
+def get_device_name():
+    device_type = htexp._get_device_type()
+
+    if device_type == htexp.synDeviceType.synDeviceGaudi:
+        return "gaudi"
+    elif device_type == htexp.synDeviceType.synDeviceGaudi2:
+        return "gaudi2"
+    elif device_type == htexp.synDeviceType.synDeviceGaudi3:
+        return "gaudi3"
 
 def get_input_shape_and_comm_size(size, token_dim=4096):
     """Convert size to appropriate input shape for AllReduce operations"""
@@ -205,7 +216,7 @@ def setup_vllm_distributed(world_size, rank, use_slurm):
         local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
 
     # Set CUDA device
-    torch.cuda.set_device(local_rank)
+    # torch.cuda.set_device(local_rank)
 
     # Initialize distributed environment
     if not torch.distributed.is_initialized():
@@ -228,7 +239,7 @@ def setup_vllm_distributed(world_size, rank, use_slurm):
                 rank=rank,
                 distributed_init_method=distributed_init_method,
                 local_rank=local_rank,
-                backend="nccl",
+                backend="hccl",
             )
         except Exception as e:
             print(f"\nERROR: Failed to initialize distributed environment: {e}")
@@ -259,74 +270,38 @@ def benchmark_vllm_allreduce(
     num_runs = 20
 
     # Warmup communication
-    warmup_tensor = torch.ones(1, dtype=torch_dtype, device="cuda")
+    warmup_tensor = torch.ones(1, dtype=torch_dtype, device="hpu")
     _ = vllm_mods["tensor_model_parallel_all_reduce"](warmup_tensor)
-    torch.cuda.synchronize()
+    torch.hpu.synchronize()
 
     size = min_size
     while size < max_size:
         input_shape = get_input_shape_and_comm_size(size)
 
         # Test both graph capture and eager mode
-        for use_graph in [True, False]:
+        for use_graph in [False]:
             mode_str = "graph" if use_graph else "eager"
 
-            if use_graph:
-                # Graph capture mode
-                with vllm_mods["graph_capture"](device=torch.cuda.current_device()) as graph_capture_context:
-                    # Create input tensors
-                    input_tensors = []
-                    for _ in range(repeat_n):
-                        inp = torch.ones(input_shape, dtype=torch_dtype, device="cuda")
-                        input_tensors.append(inp)
+            # Eager mode
+            input_tensor = torch.ones(input_shape, dtype=torch_dtype, device="hpu")
 
-                    torch.cuda.synchronize()
-                    graph = torch.cuda.CUDAGraph()
+            # Warmup
+            torch.hpu.synchronize()
+            for _ in range(num_warmups):
+                for _ in range(repeat_n):
+                    _ = vllm_mods["tensor_model_parallel_all_reduce"](input_tensor.clone())
+            torch.hpu.synchronize()
 
-                    with torch.cuda.graph(graph, stream=graph_capture_context.stream):
-                        outputs = []
-                        for inp in input_tensors:
-                            out = vllm_mods["tensor_model_parallel_all_reduce"](inp)
-                            outputs.append(out)
+            # Timing
+            # start_event = torch.cuda.Event(enable_timing=True)
+            # end_event = torch.cuda.Event(enable_timing=True)
 
-                # Warmup and timing
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-
-                torch.cuda.synchronize()
-                for i in range(num_warmups):
-                    graph.replay()
-                torch.cuda.synchronize()
-
-                start_event.record()
-                for i in range(num_runs):
-                    graph.replay()
-                end_event.record()
-                torch.cuda.synchronize()
-
-            else:
-                # Eager mode
-                input_tensor = torch.ones(input_shape, dtype=torch_dtype, device="cuda")
-
-                # Warmup
-                torch.cuda.synchronize()
-                for _ in range(num_warmups):
-                    for _ in range(repeat_n):
-                        _ = vllm_mods["tensor_model_parallel_all_reduce"](input_tensor.clone())
-                torch.cuda.synchronize()
-
-                # Timing
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-
-                start_event.record()
-                for _ in range(num_runs):
-                    for _ in range(repeat_n):
-                        _ = vllm_mods["tensor_model_parallel_all_reduce"](input_tensor.clone())
-                end_event.record()
-                torch.cuda.synchronize()
-
-            latency = start_event.elapsed_time(end_event) / num_runs / repeat_n
+            start_time = time.time()
+            for _ in range(num_runs):
+                for _ in range(repeat_n):
+                    _ = vllm_mods["tensor_model_parallel_all_reduce"](input_tensor.clone())
+            torch.hpu.synchronize()
+            latency = (time.time() - start_time) / num_runs / repeat_n
 
             if rank == 0:
                 print(f"[vLLM-{mode_str}] Size: {size}, Latency: {latency:.4f} ms")
@@ -349,9 +324,9 @@ def benchmark_vllm_allreduce(
                             "backend": f"vllm_{mode_str}",
                         }
                     ],
-                    framework="vLLM",
+                    framework="vLLM-HPU",
                     version=vllm_version,
-                    device_name=torch.cuda.get_device_name(),
+                    device_name=get_device_name(),
                     op_name="all_reduce",
                     kernel_source=f"vLLM_custom_{mode_str}",
                     perf_filename=perf_filename,
@@ -423,7 +398,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend", "-b", choices=["trtllm", "vllm"], default="trtllm", help="AllReduce backend to benchmark"
     )
-    parser.add_argument("--dtype", "-t", default="float16")
+    parser.add_argument("--dtype", "-t", default="bfloat16")
     parser.add_argument(
         "--range",
         "-r",

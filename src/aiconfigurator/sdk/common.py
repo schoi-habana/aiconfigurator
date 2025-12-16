@@ -161,7 +161,7 @@ CachedHFModels = {
 """
 Supported systems (GPU types)
 """
-SupportedSystems = {"h100_sxm", "h200_sxm", "b200_sxm", "gb200_sxm", "a100_sxm", "l40s"}
+SupportedSystems = {"h100_sxm", "h200_sxm", "b200_sxm", "gb200_sxm", "a100_sxm", "l40s", "g3"}
 
 """
 Model family for model definition
@@ -345,6 +345,7 @@ class BackendName(Enum):
     trtllm = "trtllm"
     sglang = "sglang"
     vllm = "vllm"
+    vllm_hpu = "vllm_hpu"
 
 
 class PerfDataFilename(Enum):
@@ -354,6 +355,7 @@ class PerfDataFilename(Enum):
 
     gemm = "gemm_perf.txt"
     nccl = "nccl_perf.txt"
+    hccl = "hccl_perf.txt"
     generation_attention = "generation_attention_perf.txt"
     context_attention = "context_attention_perf.txt"
     context_mla = "context_mla_perf.txt"
@@ -379,6 +381,7 @@ class GEMMQuantMode(Enum):
     GEMM quant mode.
     """
 
+    bfloat16 = QuantMapping(2, 1, "bfloat16")
     float16 = QuantMapping(2, 1, "float16")  # w16a16
     int8_wo = QuantMapping(1, 1, "int8_wo")  # w8a16
     int4_wo = QuantMapping(0.5, 1, "int4_wo")  # w4a16
@@ -396,6 +399,7 @@ class MoEQuantMode(Enum):
     MoE quant mode.
     """
 
+    bfloat16 = QuantMapping(2, 1, "bfloat16")
     float16 = QuantMapping(2, 1, "float16")  # w16a16
     fp8 = QuantMapping(1, 2, "fp8")  # w8fp8
     int4_wo = QuantMapping(0.5, 1, "int4_wo")  # w4a16
@@ -410,6 +414,7 @@ class FMHAQuantMode(Enum):
     FMHA quant mode.
     """
 
+    bfloat16 = QuantMapping(0, 1, "bfloat16")
     float16 = QuantMapping(0, 1, "float16")
     fp8 = QuantMapping(0, 2, "fp8")
     fp8_block = QuantMapping(1, 2, "fp8_block")  # specific for sglang
@@ -420,6 +425,7 @@ class KVCacheQuantMode(Enum):
     KVCache quant mode.
     """
 
+    bfloat16 = QuantMapping(2, 0, "bfloat16")
     float16 = QuantMapping(2, 0, "float16")
     int8 = QuantMapping(1, 0, "int8")
     fp8 = QuantMapping(1, 0, "fp8")

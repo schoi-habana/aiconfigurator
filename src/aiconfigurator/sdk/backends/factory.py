@@ -6,6 +6,7 @@ from aiconfigurator.sdk.backends.base_backend import BaseBackend
 from aiconfigurator.sdk.backends.sglang_backend import SGLANGBackend
 from aiconfigurator.sdk.backends.trtllm_backend import TRTLLMBackend
 from aiconfigurator.sdk.backends.vllm_backend import VLLMBackend
+from aiconfigurator.sdk.backends.vllm_hpu_backend import VLLMHpuBackend
 
 
 def get_backend(backend_name: str) -> BaseBackend:
@@ -19,6 +20,7 @@ def get_backend(backend_name: str) -> BaseBackend:
         common.BackendName.trtllm: TRTLLMBackend,
         common.BackendName.sglang: SGLANGBackend,
         common.BackendName.vllm: VLLMBackend,
+        common.BackendName.vllm_hpu: VLLMHpuBackend,
     }
 
     backend_class = backend_map.get(common.BackendName[backend_name])

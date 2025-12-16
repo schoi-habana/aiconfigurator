@@ -70,7 +70,7 @@ def _add_default_mode_arguments(parser):
         "--backend",
         choices=[backend.value for backend in common.BackendName],
         type=str,
-        default=common.BackendName.trtllm.value,
+        default=common.BackendName.vllm_hpu.value,
         help="Backend name.",
     )
     parser.add_argument(

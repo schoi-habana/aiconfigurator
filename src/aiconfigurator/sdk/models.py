@@ -456,7 +456,7 @@ class LLAMAModel(BaseModel):
                     1,
                     self._vocab_size // tp_size,
                     h,
-                    common.GEMMQuantMode.float16,
+                    gemm_quant_mode,#common.GEMMQuantMode.float16,
                 ),
             ]
         )
@@ -513,7 +513,7 @@ class LLAMAModel(BaseModel):
                     1,
                     self._vocab_size // tp_size,
                     h,
-                    common.GEMMQuantMode.float16,
+                    gemm_quant_mode,#common.GEMMQuantMode.float16,
                 ),
             ]
         )

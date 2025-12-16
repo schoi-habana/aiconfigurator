@@ -19,7 +19,7 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
-from vllm.platforms import _Backend, current_platform
+from vllm.platforms import current_platform, _Backend
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, cdiv, resolve_obj_by_qualname
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -149,6 +149,7 @@ def create_standard_kv_cache_spec(vllm_config: VllmConfig, use_fp8_kv_cache: boo
         head_size=vllm_config.model_config.get_head_size(),
         dtype=current_platform.fp8_dtype() if use_fp8_kv_cache else vllm_config.model_config.dtype,
         sliding_window=vllm_config.model_config.get_sliding_window(),
+        # use_mla=False,
     )
 
 
@@ -165,7 +166,6 @@ def create_vllm_config(
     add_mock_model_methods: bool = True,
 ) -> VllmConfig:
     """Create a VllmConfig for testing with reasonable defaults."""
-
     model_config = ModelConfig(
         model=model_name,
         tokenizer=model_name,
@@ -173,12 +173,14 @@ def create_vllm_config(
         dtype=dtype,
         seed=0,
         max_model_len=max_model_len,
+        enable_prefix_caching=False,
     )
 
     cache_config = CacheConfig(
         block_size=block_size,
         cache_dtype="auto",
         swap_space=0,
+        enable_prefix_caching=False,
     )
     # Set cache blocks for testing
     #   (these may be set during initialization normally)

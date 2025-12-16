@@ -9,11 +9,13 @@ import os
 import signal
 import sys
 import traceback
+import csv
+import time
 
-try:
-    from cuda import cuda
-except:
-    from cuda.bindings import driver as cuda
+# try:
+#     from cuda import cuda
+# except:
+#     from cuda.bindings import driver as cuda
 from datetime import datetime
 from pathlib import Path
 
@@ -250,17 +252,59 @@ def log_perf(
     kernel_source: str,
     perf_filename: str,
 ):
-    content_prefix = f"{framework},{version},{device_name},{op_name},{kernel_source}"
-    header_prefix = "framework,version,device,op_name,kernel_source"
-    for item in item_list:
-        for key, value in item.items():
-            content_prefix += f",{value}"
-            header_prefix += f",{key}"
+    lock_file = perf_filename + ".lock"
 
-    with open(perf_filename, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    # Try for 1 seconds (10 attempts * 0.1s)
+    got_lock = False
+    for _ in range(10):
+        try:
+            # "Create this file, but fail if it exists" (Atomic & NFS safe)
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            got_lock = True
+            break
+        except OSError:
+            time.sleep(0.1)
 
-        if os.fstat(f.fileno()).st_size == 0:
-            f.write(header_prefix + "\n")
+    if not got_lock:
+        print(f"Skipping log: Could not get lock for {perf_filename}")
+        # Optional: Force delete lock_file here if you are brave and assume a crash
+        return 
 
-        f.write(content_prefix + "\n")
+    try:
+        with open(perf_filename, "a", newline="") as f:
+            # Logic to add header only if empty
+            is_empty = os.fstat(f.fileno()).st_size == 0
+            
+            # Prepare data
+            base_data = {
+                "framework": framework, "version": version, 
+                "device": device_name, "op_name": op_name, 
+                "kernel_source": kernel_source
+            }
+            
+            # Get headers from first item if exists
+            fieldnames = list(base_data.keys())
+            if item_list:
+                fieldnames += list(item_list[0].keys())
+
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            
+            if is_empty:
+                writer.writeheader()
+
+            for item in item_list:
+                writer.writerow(base_data | item)
+            
+            # FORCE DISK WRITE (Crucial for NFS)
+            f.flush()
+            os.fsync(f.fileno())
+
+    except Exception as e:
+        print(f"Error writing log: {e}")
+
+    finally:
+        # --- 3. RELEASE ---
+        # Always delete the lock file, even if writing crashed
+        if got_lock and os.path.exists(lock_file):
+            os.unlink(lock_file)

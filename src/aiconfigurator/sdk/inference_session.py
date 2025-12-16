@@ -425,8 +425,8 @@ class DisaggInferenceSession:
             # minor perf optimization: convert num_gpu_list to a set to speed up lookup
             num_gpu_set = set(num_gpu_list) if num_gpu_list is not None else None
             for decode_num_worker in decode_num_worker_list:
-                for prefill_num_worker in prefill_num_worker_list:
-                    num_gpu = prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker
+                for prefill_num_worker in prefill_num_worker_list: #num instances
+                    num_gpu = prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker #total_num_gpu
                     if num_gpu_set is not None and num_gpu not in num_gpu_set:
                         continue
 
@@ -595,9 +595,9 @@ class DisaggInferenceSession:
                         prefill_gpus = prefill_worker["num_total_gpus"]
                         prefill_num_worker, decode_num_worker = _match_workers(
                             prefill_throughput=prefill_throughput,
-                            prefill_gpus=prefill_gpus,
+                            prefill_gpus=prefill_gpus, #parallellism
                             decode_throughput=decode_throughput,
-                            decode_gpus=decode_gpus,
+                            decode_gpus=decode_gpus, #parallelism
                             prefill_num_worker_list=prefill_num_worker_list,
                             decode_num_worker_list=decode_num_worker_list,
                             num_gpu_list=num_gpu_list,

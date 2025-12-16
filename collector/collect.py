@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
 import warnings
-
+import subprocess
+from packaging import version as version_package
 
 def setup_warning_filters():
     """Configure warning filters to suppress known non-critical warnings"""
@@ -81,8 +82,8 @@ def worker(queue, device_id: int, func, progress_value, lock, error_queue=None, 
     setup_signal_handlers(device_id, error_queue)
 
     # Setup device
-    device = torch.device(f"cuda:{device_id}")
-    torch.cuda.set_device(device_id)
+    device = torch.device("hpu")
+    # torch.cuda.set_device(device_id)
     worker_logger.info(f"Worker {device_id} initialized for {module_name}")
 
     # Process tasks
@@ -105,7 +106,7 @@ def worker(queue, device_id: int, func, progress_value, lock, error_queue=None, 
 
         try:
             worker_logger.debug(f"Starting task {task_id}")
-            func(*task, device)
+            func(*task, device, device_id)
             worker_logger.debug(f"Completed task {task_id}")
         except Exception as e:
             error_info = {
@@ -470,6 +471,51 @@ def collect_vllm(num_processes: int, ops: list[str] | None = None):
 
     generate_collection_summary(all_errors, "vllm", version)
 
+def collect_vllm_hpu(num_processes: int, ops: list[str] | None = None):
+    """
+    Collect performance data for VLLM v1.
+    """
+
+    try:
+        from vllm.version import __version__ as vllm_version
+
+        version = vllm_version
+
+    except:
+        logger.exception("VLLM is not installed. Please install it from https://github.com/vllm-project/vllm")
+        return
+
+    collections = [
+        # GEMM collections
+        # vllm v1 GEMM collection for fp16, fp8, fp8_block, nvfp4, awq, and gptq
+        {
+            "name": "vllm-hpu",
+            "type": "gemm",
+            "module": "collector.vllm-hpu.collect_gemm",
+            "get_func": "get_gemm_test_cases",
+            "run_func": "run_gemm",
+        },
+        # Attention collections - separate entries for context and generation
+        {
+            "name": "vllm-hpu",
+            "type": "attention_context",
+            "module": "collector.vllm-hpu.collect_attn",
+            "get_func": "get_context_attention_test_cases",
+            "run_func": "run_attention_torch",
+        },
+        {
+            "name": "vllm-hpu",
+            "type": "attention_generation",
+            "module": "collector.vllm-hpu.collect_attn",
+            "get_func": "get_generation_attention_test_cases",
+            "run_func": "run_attention_torch",
+        },
+    ]
+
+    all_errors = collect_ops(num_processes, collections, ops, version)
+
+    generate_collection_summary(all_errors, "vllm-hpu", version)
+
 
 def collect_trtllm(num_processes: int, ops: list[str] | None = None):
     """Collect performance data for TensorRT LLM with enhanced error tracking"""
@@ -583,6 +629,97 @@ def collect_trtllm(num_processes: int, ops: list[str] | None = None):
     generate_collection_summary(all_errors, "trtllm", version)
 
 
+def collect_hpu(num_processes: int, ops: list[str] | None = None):
+    """Collect performance data for TensorRT LLM with enhanced error tracking"""
+    all_errors = []
+
+    # os.environ["TLLM_LOG_LEVEL"] = "ERROR"
+    # os.environ["TRTLLM_DG_ENABLED"] = "1"
+    # # Suppress flashinfer logging
+    # os.environ["FLASHINFER_LOG_LEVEL"] = "ERROR"
+
+    try:
+        output = subprocess.run(
+            "pip list | grep habana-torch-plugin",
+            shell=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        version = str(version_package.parse(output.stdout.split("\n")[0].split()[-1]))
+        
+        # with (
+        #     open(os.devnull, "w") as _null,
+        #     contextlib.redirect_stdout(_null),
+        #     contextlib.redirect_stderr(_null),
+        # ):
+        #     import tensorrt_llm
+        # version = tensorrt_llm.__version__
+        logger.info(f"Synapse version: {version}")
+    except:
+        logger.exception("Synapse is not installed")
+        return
+
+    # Define collection modules - each test type as separate entry
+    collections = [
+        # GEMM collections
+        {
+            "name": "hpu",
+            "type": "gemm",
+            "module": "hpu.collect_gemm",
+            "get_func": "get_gemm_test_cases",
+            "run_func": "run_gemm",
+        },
+        # Attention collections - separate entries for context and generation
+        {
+            "name": "hpu",
+            "type": "attention_context",
+            "module": "hpu.collect_attn",
+            "get_func": "get_context_attention_test_cases",
+            "run_func": "run_attention_torch",
+        },
+        # TODO: attention_generation, mla, and moe need to be added for HPU backend
+    ]
+
+    for collection in collections:
+        if ops and (collection["type"] not in ops):
+            continue
+        try:
+            # Handle version-specific modules
+            if "version_handler" in collection:
+                module_name = collection["version_handler"](version)
+                if not module_name:
+                    logger.warning(
+                        f"Skipping {collection['name']}.{collection['type']} - unsupported version {version}",
+                    )
+                    continue
+            else:
+                module_name = collection["module"]
+
+            get_module = __import__(module_name, fromlist=[collection["get_func"]])
+            run_module = __import__(module_name, fromlist=[collection["run_func"]])
+
+            get_func = getattr(get_module, collection["get_func"])
+            run_func = getattr(run_module, collection["run_func"])
+
+            errors = collect_module_safe(collection["name"], collection["type"], get_func, run_func, num_processes)
+            all_errors.extend(errors)
+
+        except Exception as e:
+            logger.exception(f"Failed to process {collection['name']}.{collection['type']}")
+            all_errors.append(
+                {
+                    "module": f"{collection['name']}.{collection['type']}",
+                    "error_type": "ImportError",
+                    "error_message": str(e),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+
+    # Generate summary report
+    generate_collection_summary(all_errors, "hpu", version)
+
+
 def generate_collection_summary(all_errors, backend, version):
     """Generate comprehensive collection summary"""
     summary = {
@@ -630,7 +767,7 @@ def generate_collection_summary(all_errors, backend, version):
 def main():
     global logger
     parser = argparse.ArgumentParser(description="Collect performance data for backends")
-    parser.add_argument("--backend", type=str, choices=["trtllm", "sglang", "vllm"], default="trtllm")
+    parser.add_argument("--backend", type=str, choices=["trtllm", "sglang", "vllm", "vllm-hpu", "hpu"], default="trtllm")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument(
         "--ops",
@@ -661,7 +798,11 @@ def main():
         # Update log level if debug flag changed
         setup_logging(debug=args.debug)
 
-    num_processes = torch.cuda.device_count()
+    if args.backend in ["trtllm", "sglang", "vllm"]:
+        num_processes = torch.cuda.device_count()
+    else:
+        num_processes = torch.hpu.device_count()
+
     logger.info(f"Starting collection with {num_processes} GPU processes")
 
     mp.set_start_method("spawn")
@@ -671,7 +812,11 @@ def main():
     elif args.backend == "sglang":
         collect_sglang(num_processes, ops)
     elif args.backend == "vllm":
-        collect_vllm(num_processes, ops)
+        collect_vllm(num_processes)
+    elif args.backend == "vllm-hpu":
+        collect_vllm_hpu(num_processes)
+    elif args.backend == "hpu":
+        collect_hpu(num_processes, ops)
 
 
 if __name__ == "__main__":

@@ -300,6 +300,39 @@ def load_nccl_data(nccl_file):
 
     return nccl_data
 
+def load_hccl_data(hccl_file):
+    """
+    Load the hccl data
+    """
+    if not os.path.exists(hccl_file):
+        logger.warning(f"HCCL data file {hccl_file} not found.")
+        return None
+    hccl_data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))
+
+    with open(hccl_file, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    for row in rows:
+        dtype, num_gpus, message_size, op_name, latency = (
+            row["nccl_dtype"],
+            row["num_gpus"],
+            row["message_size"],
+            row["op_name"],
+            row["latency"],
+        )
+        message_size = int(message_size)
+        latency = float(latency)
+        num_gpus = int(num_gpus)
+
+        dtype = common.CommQuantMode[dtype]
+        try:
+            latency = hccl_data[dtype][op_name][num_gpus][message_size]
+            logger.debug(f"value conflict in nccl data: {dtype} {op_name} {num_gpus} {message_size} {latency}")
+        except KeyError:
+            hccl_data[dtype][op_name][num_gpus][message_size] = latency
+
+    return hccl_data
 
 def load_gemm_data(gemm_file):
     """
@@ -1086,13 +1119,24 @@ class PerfDatabase:
         self._default_sol_mode = common.SOLMode.NON_SOL  # non sol
 
         data_dir = os.path.join(systems_dir, self.system_spec["data_dir"], backend, version)
-        nccl_data_dir = os.path.join(
-            systems_dir,
-            self.system_spec["data_dir"],
-            "nccl",
-            self.system_spec["misc"]["nccl_version"],
-            common.PerfDataFilename.nccl.value,
-        )
+        if 'hpu' not in backend:
+            nccl_data_dir = os.path.join(
+                systems_dir,
+                self.system_spec["data_dir"],
+                "nccl",
+                self.system_spec["misc"]["nccl_version"],
+                common.PerfDataFilename.nccl.value,
+            )
+            hccl_data_dir = None
+        else:
+            nccl_data_dir = None
+            hccl_data_dir = os.path.join(
+                systems_dir,
+                self.system_spec["data_dir"],
+                "hccl",
+                self.system_spec["misc"]["hccl_version"],
+                common.PerfDataFilename.hccl.value,
+            )
 
         if backend == "sglang":
             # For SGLang, only load MoE and MLP data and provide empty structures for other data
@@ -1142,7 +1186,7 @@ class PerfDatabase:
             self._wideep_deepep_ll_data = load_wideep_deepep_ll_data(
                 os.path.join(data_dir, common.PerfDataFilename.wideep_deepep_ll.value)
             )
-        elif backend == "vllm":
+        elif backend =="vllm":
             self._gemm_data = load_gemm_data(os.path.join(data_dir, common.PerfDataFilename.gemm.value))
             self._context_attention_data = load_context_attention_data(
                 os.path.join(data_dir, common.PerfDataFilename.context_attention.value)
@@ -1154,6 +1198,22 @@ class PerfDatabase:
                 os.path.join(data_dir, common.PerfDataFilename.custom_allreduce.value)
             )
             self._nccl_data = load_nccl_data(nccl_data_dir)
+            self._mla_bmm_data = None
+            self._moe_data, self._moe_low_latency_data = None, None
+            self._context_mla_data = None
+            self._generation_mla_data = None
+        elif backend =="vllm_hpu":
+            self._gemm_data = load_gemm_data(os.path.join(data_dir, common.PerfDataFilename.gemm.value))
+            self._context_attention_data = load_context_attention_data(
+                os.path.join(data_dir, common.PerfDataFilename.context_attention.value)
+            )
+            self._generation_attention_data = load_generation_attention_data(
+                os.path.join(data_dir, common.PerfDataFilename.generation_attention.value)
+            )
+            self._custom_allreduce_data = load_custom_allreduce_data(
+                os.path.join(data_dir, common.PerfDataFilename.custom_allreduce.value)
+            )
+            self._nccl_data = load_hccl_data(hccl_data_dir)
             self._mla_bmm_data = None
             self._moe_data, self._moe_low_latency_data = None, None
             self._context_mla_data = None
@@ -1642,7 +1702,7 @@ class PerfDatabase:
                 "nccl": [key.name for key in self._nccl_data],
                 "moe": [key.name for key in self._moe_data],
             }
-        elif self.backend == "vllm":  # TODO: add support for moe and deepseek
+        elif "vllm" in self.backend:  # TODO: add support for moe and deepseek
             self.supported_quant_mode = {
                 "gemm": [key.name for key in self._gemm_data],
                 "context_attention": [key.name for key in self._context_attention_data],

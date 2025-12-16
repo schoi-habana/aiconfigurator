@@ -45,7 +45,7 @@ dtypes=("half" "int8")
 for n in "${num_gpus_nccl[@]}"; do
     for op in "${nccl_ops[@]}"; do
         for dtype in "${dtypes[@]}"; do
-            python3 collect_nccl.py -n "$n" -NCCL "$op" --dtype "$dtype"
+            python3 collect_hccl.py -n "$n" -HCCL "$op" --dtype "$dtype"
         done
     done
 done
