@@ -6,6 +6,7 @@ import os
 import time
 
 import torch
+from torch.profiler import schedule, profile, record_function, ProfilerActivity
 import torch.distributed as dist
 from vllm.distributed import (
     init_distributed_environment,
@@ -19,6 +20,7 @@ from vllm.version import __version__ as vllm_version
 
 from helper import get_sm_version, log_perf
 import habana_frameworks.torch.utils.experimental as htexp
+import habana_frameworks.torch.core as htcore
 
 def get_device_name():
     device_type = htexp._get_device_type()
@@ -119,14 +121,13 @@ def get_gemm_test_cases(is_unit_test=False):
 
 
 def run_gemm(gemm_type, m, n, k, perf_filename, device="hpu", device_id=0):
-    print("*****************", device_id)
     setup_distributed(device, device_id)
 
     torch.set_default_dtype(torch.bfloat16)
     # torch.cuda.set_device(device)
 
     dtype = torch.bfloat16
-    x = torch.randn((m, k), dtype=dtype, device=torch.device(device))
+    x = torch.randn((m, k), dtype=dtype, device=device)
 
     if gemm_type == "fp8":
         qc = Fp8Config(
@@ -152,11 +153,11 @@ def run_gemm(gemm_type, m, n, k, perf_filename, device="hpu", device_id=0):
         params_dtype=dtype,
         quant_config=qc,
         prefix="",
-        # return_bias=True,
-        # disable_tp=True,
+        return_bias=True,
+        disable_tp=True,
     )
     # TODO, to evaluate random weights impact
-    gemm.to(torch.device(device))
+    gemm.to(device)
 
     if gemm_type == "fp8" and hasattr(gemm, "weight"):
         new_weight = gemm.weight.data.t()
@@ -165,28 +166,29 @@ def run_gemm(gemm_type, m, n, k, perf_filename, device="hpu", device_id=0):
         gemm.weight = torch.nn.Parameter(new_weight)
         # print("after fix, weight stride:", gemm.weight.data.stride())
 
-    gemm.forward(x)  # dry run to init
+    import habana_frameworks.torch as htorch
+    gemm = htorch.hpu.wrap_in_hpu_graph(gemm)
 
     num_warmups = 3
     num_runs = 6
 
-    # capture
-    # g = torch.cuda.CUDAGraph()
-    # with torch.cuda.graph(g):
-    #     for i in range(num_runs):
-    #         gemm.forward(x)
     # warmup
     for i in range(num_warmups):
         gemm.forward(x)
+    torch.hpu.synchronize()
 
-    # start_event = torch.cuda.Event(enable_timing=True)
-    # end_event = torch.cuda.Event(enable_timing=True)
-    # start_event.record()
+    activities = [ProfilerActivity.CPU, ProfilerActivity.HPU]
     start_time = time.time()
+    # with profile(
+    #     activities=activities,
+    #     schedule=schedule(wait=0, warmup=0, active=num_runs, repeat=1),
+    #     with_stack=True,
+    #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_logs')
+    # ) as prof:
     for i in range(num_runs):
         gemm.forward(x)
-    # end_event.record()
-    torch.hpu.synchronize()
+        # prof.step()
+        torch.hpu.synchronize()
     latency = (time.time() - start_time) / (num_runs) *1000 #ms
 
     log_perf(

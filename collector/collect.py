@@ -499,14 +499,14 @@ def collect_vllm_hpu(num_processes: int, ops: list[str] | None = None):
         {
             "name": "vllm-hpu",
             "type": "attention_context",
-            "module": "collector.vllm-hpu.collect_attn",
+            "module": "collector.vllm-hpu.collect_attn_context",
             "get_func": "get_context_attention_test_cases",
             "run_func": "run_attention_torch",
         },
         {
             "name": "vllm-hpu",
             "type": "attention_generation",
-            "module": "collector.vllm-hpu.collect_attn",
+            "module": "collector.vllm-hpu.collect_attn_generation",
             "get_func": "get_generation_attention_test_cases",
             "run_func": "run_attention_torch",
         },
@@ -801,7 +801,8 @@ def main():
     if args.backend in ["trtllm", "sglang", "vllm"]:
         num_processes = torch.cuda.device_count()
     else:
-        num_processes = torch.hpu.device_count()
+        import habana_frameworks.torch.utils.experimental as htexp
+        num_processes = htexp.hpu.device_count()
 
     logger.info(f"Starting collection with {num_processes} GPU processes")
 
