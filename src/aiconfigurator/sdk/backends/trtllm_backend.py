@@ -17,11 +17,6 @@ from aiconfigurator.sdk.perf_database import PerfDatabase
 logger = logging.getLogger(__name__)
 
 
-MAX_NORMAL_CTX_TOKENS = 8192
-MAX_CTX_TOKENS_MULTIPLE_OF_ISL = 2
-MAX_CTX_TOKENS_SEARCH_STEPS = 8  # for ctx stride large for faster sweeping
-
-
 class TRTLLMBackend(BaseBackend):
     """
     TRTLLM backend.
@@ -94,7 +89,13 @@ class TRTLLMBackend(BaseBackend):
                 isl: int,
                 osl: int,
                 prefix: int,
-            ) -> float:
+            ) -> tuple[float, float]:
+                """
+                Get mixed step latency and energy.
+
+                Returns:
+                    tuple: (latency in ms, energy in watt-milliseconds)
+                """
                 num_tokens = ctx_tokens + gen_tokens
                 # treat this as a combined single batch inference, extract non-attention latency
                 summary = self.run_static(
@@ -107,10 +108,13 @@ class TRTLLMBackend(BaseBackend):
                     mode="static_ctx",
                 )
                 latency_dict = summary.get_context_latency_dict()
-                non_attention_latency = 0.0
+                energy_wms_dict = summary.get_context_energy_wms_dict()  # CHANGED from get_context_power_dict()
+                non_attention_latency_ms = 0.0
+                non_attention_energy_wms = 0.0  # RENAMED from non_attention_power_weighted
                 for layer_name, latency in latency_dict.items():
                     if layer_name != "context_attention":
-                        non_attention_latency += latency
+                        non_attention_latency_ms += latency
+                        non_attention_energy_wms += energy_wms_dict.get(layer_name, 0.0)  # SIMPLIFIED
 
                 # second pass to get ctx attn, split full isl over
                 # num_steps(=np.ceil(isl/ctx_tokens))
@@ -124,9 +128,14 @@ class TRTLLMBackend(BaseBackend):
                     mode="static_ctx",
                 )
                 latency_dict = summary.get_context_latency_dict()
-                ctx_attention_latency = latency_dict["context_attention"] / (np.ceil(isl / ctx_tokens))
+                energy_wms_dict = summary.get_context_energy_wms_dict()
+                scale_factor = np.ceil(isl / ctx_tokens)
+                ctx_attention_latency_ms = latency_dict["context_attention"] / scale_factor
+                ctx_attention_energy_wms = energy_wms_dict.get("context_attention", 0.0) / scale_factor  # CHANGED
 
                 # third pass to get generation attn. use isl+osl//2 for avg generation attn latency.
+                gen_attention_latency_ms = 0.0
+                gen_attention_energy_wms = 0.0  # RENAMED from gen_attention_power_weighted
                 if gen_tokens > 0:
                     num_tokens = gen_tokens
                     summary = self.run_static(
@@ -136,17 +145,27 @@ class TRTLLMBackend(BaseBackend):
                         mode="static_gen",
                     )
                     latency_dict = summary.get_generation_latency_dict()
-                    gen_attention_latency = latency_dict["generation_attention"]
-                else:
-                    gen_attention_latency = 0.0
+                    energy_wms_dict = summary.get_generation_energy_wms_dict()
+                    gen_attention_latency_ms = latency_dict["generation_attention"]
+                    gen_attention_energy_wms = energy_wms_dict.get("generation_attention", 0.0)  # CHANGED
 
-                return non_attention_latency + ctx_attention_latency + gen_attention_latency
+                # Combine all components (simple addition)
+                total_latency_ms = non_attention_latency_ms + ctx_attention_latency_ms + gen_attention_latency_ms
+                total_energy_wms = non_attention_energy_wms + ctx_attention_energy_wms + gen_attention_energy_wms
+
+                return total_latency_ms, total_energy_wms
 
             def _get_genonly_step_latency(
                 model: BaseModel, database: PerfDatabase, gen_tokens: int, isl: int, osl: int
-            ) -> float:
+            ) -> tuple[float, float]:
+                """
+                Get generation-only step latency and energy.
+
+                Returns:
+                    tuple: (latency in ms, energy in watt-milliseconds)
+                """
                 if gen_tokens <= 0:
-                    return 0.0
+                    return 0.0, 0.0
                 num_tokens = gen_tokens
                 summary = self.run_static(
                     model,
@@ -155,18 +174,25 @@ class TRTLLMBackend(BaseBackend):
                     mode="static_gen",
                 )
                 latency_dict = summary.get_generation_latency_dict()
-                genonly_step_latency = 0.0
+                energy_wms_dict = summary.get_generation_energy_wms_dict()  # CHANGED
+                genonly_step_latency_ms = 0.0
+                genonly_step_energy_wms = 0.0  # RENAMED from genonly_power_weighted
                 for layer_name, latency in latency_dict.items():
-                    genonly_step_latency += latency
+                    genonly_step_latency_ms += latency
+                    genonly_step_energy_wms += energy_wms_dict.get(layer_name, 0.0)  # SIMPLIFIED
 
-                return genonly_step_latency
+                return genonly_step_latency_ms, genonly_step_energy_wms
 
-            mix_step_latency = _get_mix_step_latency(
+            # Call helpers (now return energy in W·ms instead of power)
+            mix_step_latency_ms, mix_step_energy_wms = _get_mix_step_latency(
                 model, database, num_mix_ctx_tokens, num_mix_gen_tokens, isl, osl, prefix
             )
-            genonly_step_latency = _get_genonly_step_latency(model, database, num_genonly_tokens, isl, osl)
+            genonly_step_latency_ms, genonly_step_energy_wms = _get_genonly_step_latency(
+                model, database, num_genonly_tokens, isl, osl
+            )
 
-            ttft = mix_step_latency * np.ceil(isl / ctx_tokens)
+            # Calculate timing (unchanged)
+            ttft = mix_step_latency_ms * np.ceil(isl / ctx_tokens)
             # correction for ttft in trtllm agg mode, assume we have requests 10x of concurrency
             # (batch size here) to mitigate the impact of first round latency
             # assume we need to increase x of requests when concurrency gets larger.
@@ -178,11 +204,14 @@ class TRTLLMBackend(BaseBackend):
                 f"{correction_factor} when b: {b}, ctx_tokens: {ctx_tokens} isl {isl}"
             )
 
-            tpot = (mix_step_latency * num_mix_steps_for_tpot_calc + genonly_step_latency * num_genonly_steps) / (
+            tpot = (mix_step_latency_ms * num_mix_steps_for_tpot_calc + genonly_step_latency_ms * num_genonly_steps) / (
                 num_mix_steps_for_tpot_calc + num_genonly_steps
             )
             output_throughput = (
-                1000 / (num_mix_steps * mix_step_latency + num_genonly_steps * genonly_step_latency) * b * (osl - 1)
+                1000
+                / (num_mix_steps * mix_step_latency_ms + num_genonly_steps * genonly_step_latency_ms)
+                * b
+                * (osl - 1)
             )
             logger.debug(
                 f"ctx_tokens: {ctx_tokens}, b: {b}, osl: {osl}, isl: {isl}, "
@@ -191,8 +220,30 @@ class TRTLLMBackend(BaseBackend):
                 f"num_mix_gen_tokens: {num_mix_gen_tokens}, "
                 f"num_genonly_tokens: {num_genonly_tokens}"
             )
-            logger.debug(f"mix_step_latency: {mix_step_latency}, genonly_step_latency: {genonly_step_latency}")
+            logger.debug(
+                f"mix_step_latency: {mix_step_latency_ms} ms, genonly_step_latency: {genonly_step_latency_ms} ms"
+            )
+            logger.debug(
+                f"mix_step_energy: {mix_step_energy_wms} W·ms, genonly_step_energy: {genonly_step_energy_wms} W·ms"
+            )
             logger.debug(f"ttft: {ttft}, tpot: {tpot}, output_throughput: {output_throughput}")
+
+            # Calculate weighted average power (SIMPLIFIED!)
+            # Step 1: Calculate total energy (simple multiplication and addition)
+            total_mix_energy_wms = num_mix_steps * mix_step_energy_wms
+            total_genonly_energy_wms = num_genonly_steps * genonly_step_energy_wms
+            total_energy_wms = total_mix_energy_wms + total_genonly_energy_wms
+
+            # Step 2: Calculate total latency (simple multiplication and addition)
+            total_latency_ms = num_mix_steps * mix_step_latency_ms + num_genonly_steps * genonly_step_latency_ms
+
+            # Step 3: Derive average power (single division)
+            if total_latency_ms > 0:
+                agg_power_avg_w = total_energy_wms / total_latency_ms
+            else:
+                agg_power_avg_w = 0.0
+
+            logger.debug(f"Aggregated power: {agg_power_avg_w}W (from {total_energy_wms} W·ms / {total_latency_ms} ms)")
 
             num_ctx_requests = np.ceil(ctx_tokens / isl)
             num_gen_requests = b - num_ctx_requests
@@ -223,6 +274,7 @@ class TRTLLMBackend(BaseBackend):
             seq_s = request_rate
             seq_s_gpu = seq_s / pp / tp / dp
             tokens_s = output_throughput
+            request_latency = ttft + tpot * max(osl - 1, 0)
             num_total_gpus = tp * pp * dp
             parallel = f"tp{tp}pp{pp}dp{dp}etp{moe_tp}ep{moe_ep}"
             gemm = model.config.gemm_quant_mode.name
@@ -232,53 +284,52 @@ class TRTLLMBackend(BaseBackend):
             comm = model.config.comm_quant_mode.name
             mem = memory["total"]
 
-            result = pd.DataFrame(
-                columns=common.ColumnsAgg,
-                data=[
-                    [
-                        model.model_name,
-                        isl,
-                        osl,
-                        prefix,
-                        concurrency,
-                        request_rate,
-                        b,
-                        b * model.config.attention_dp_size,
-                        ttft,
-                        tpot,
-                        seq_s,
-                        seq_s_gpu,
-                        tokens_s,
-                        tokens_s_gpu,
-                        tokens_s_user,
-                        num_total_gpus,
-                        tp,
-                        pp,
-                        dp,
-                        moe_tp,
-                        moe_ep,
-                        parallel,
-                        gemm,
-                        kvcache,
-                        fmha,
-                        moe,
-                        comm,
-                        mem,
-                        balance_score,
-                        num_ctx_requests,
-                        num_gen_requests,
-                        num_tokens,
-                        ctx_tokens,
-                        num_gen_requests,
-                        database.backend,
-                        database.version,
-                        database.system,
-                    ]
-                ],
-            ).round(3)
+            result_dict = {
+                "model": model.model_name,
+                "isl": isl,
+                "osl": osl,
+                "prefix": prefix,
+                "concurrency": concurrency,
+                "request_rate": request_rate,
+                "bs": b,
+                "global_bs": b * model.config.attention_dp_size,
+                "ttft": ttft,
+                "tpot": tpot,
+                "seq/s": seq_s,
+                "seq/s/gpu": seq_s_gpu,
+                "tokens/s": tokens_s,
+                "tokens/s/gpu": tokens_s_gpu,
+                "tokens/s/user": tokens_s_user,
+                "request_latency": request_latency,
+                "num_total_gpus": num_total_gpus,
+                "tp": tp,
+                "pp": pp,
+                "dp": dp,
+                "moe_tp": moe_tp,
+                "moe_ep": moe_ep,
+                "parallel": parallel,
+                "gemm": gemm,
+                "kvcache": kvcache,
+                "fmha": fmha,
+                "moe": moe,
+                "comm": comm,
+                "memory": mem,
+                "balance_score": balance_score,
+                "num_ctx_reqs": num_ctx_requests,
+                "num_gen_reqs": num_gen_requests,
+                "num_tokens": num_tokens,
+                "ctx_tokens": ctx_tokens,
+                "gen_tokens": num_gen_requests,
+                "backend": database.backend,
+                "version": database.version,
+                "system": database.system,
+                "power_w": agg_power_avg_w,  # Weighted average power for AGG mode
+            }
+            result = pd.DataFrame([result_dict], columns=common.ColumnsAgg).round(3)
             summary = InferenceSummary(RuntimeConfig(isl=isl, osl=osl))
             summary.set_memory_and_check_oom(memory, database.system_spec["gpu"]["mem_capacity"])
             summary.set_summary_df(result)
+            summary.set_result_dict(result_dict)
 
             # caching
             self._agg_cache[isl][osl][b][ctx_tokens] = summary
@@ -314,14 +365,6 @@ class TRTLLMBackend(BaseBackend):
         ctx_stride = kwargs.get("ctx_stride", 512)
         enable_chunked_prefill = kwargs.get("enable_chunked_prefill", False)
 
-        max_ctx_tokens = max(MAX_NORMAL_CTX_TOKENS, isl * MAX_CTX_TOKENS_MULTIPLE_OF_ISL)
-        # if ctx tokens is already larger than 2048, we need to increase ctx_stride for faster
-        # sweeping
-        ctx_stride_large = max(
-            1024,
-            ctx_stride,
-            max_ctx_tokens // MAX_CTX_TOKENS_SEARCH_STEPS,
-        )
         # when b is larger than 1024, the result is not good as the data collection is not enough
         # to cover this.
         b_list_default = (
@@ -334,15 +377,6 @@ class TRTLLMBackend(BaseBackend):
             + [1024]
         )
 
-        if not enable_chunked_prefill:
-            logger.debug(
-                f"enable_chunked_prefill is off, override ctx_stride: from {ctx_stride} to {isl}, "
-                f"ctx_stride_large: from {ctx_stride_large} to "
-                f"{np.ceil(ctx_stride_large / isl) * isl}"
-            )
-            ctx_stride = isl
-            ctx_stride_large = np.ceil(ctx_stride_large / isl) * isl
-
         # sweep for batch_size and ctx_tokens
         # ctx_tokens will have a step of ctx_stride. When it's larger than 8192, we will increase
         # the step to ctx_stride_large.
@@ -352,25 +386,10 @@ class TRTLLMBackend(BaseBackend):
         # during the loop, as b, ctx_tokens and system memory are monotonic, we can break the
         # inner loop when the system is oom.
         b_list = [b for b in b_list_default if b <= max_batch_size]
-        # prepare ctx_tokens_list
-        ctx_tokens_list = []
-        ctx_tokens = 0
-        while True:
-            ctx_tokens = (
-                (ctx_tokens + ctx_stride) if ctx_tokens < MAX_NORMAL_CTX_TOKENS else (ctx_tokens + ctx_stride_large)
-            )
-            if ctx_tokens > max_ctx_tokens:
-                break
-            ctx_tokens_list.append(ctx_tokens)
-        # add those just match the multiple of isl
-        for i in range(1, MAX_CTX_TOKENS_MULTIPLE_OF_ISL + 1):
-            ctx_tokens = isl * i
-            if ctx_tokens not in ctx_tokens_list:
-                ctx_tokens_list.append(ctx_tokens)
-        ctx_tokens_list.sort()
+        ctx_tokens_list = self._get_ctx_tokens_list_for_agg_sweep(isl, ctx_stride, enable_chunked_prefill)
 
         results_df = pd.DataFrame(columns=common.ColumnsAgg)
-        df_list = []
+        results_dict_list = []
         capped_b = []
         for b in b_list:
             for ctx_tokens in ctx_tokens_list:
@@ -400,11 +419,12 @@ class TRTLLMBackend(BaseBackend):
 
                 if summary.check_oom():
                     break  # larger ctx tokens will cause oom
-                if summary.get_summary_df().loc[0, "tpot"] <= tpot and summary.get_summary_df().loc[0, "ttft"] <= ttft:
-                    df_list.append(summary.get_summary_df())
+                result_dict = summary.get_result_dict()
+                if result_dict and result_dict["tpot"] <= tpot and result_dict["ttft"] <= ttft:
+                    results_dict_list.append(result_dict)
 
-        if df_list:
-            results_df = pd.concat(df_list, axis=0, ignore_index=True)
+        if results_dict_list:
+            results_df = pd.DataFrame(results_dict_list, columns=common.ColumnsAgg).round(3)
 
         sorted_results_df = results_df.sort_values(by="seq/s", ascending=False).round(3)
         if top_k > 0:

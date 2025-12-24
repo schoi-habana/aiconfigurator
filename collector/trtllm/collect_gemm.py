@@ -5,58 +5,18 @@ import math
 
 import tensorrt_llm
 import torch
+from common_test_cases import get_gemm_common_test_cases
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
-from helper import get_sm_version, log_perf
+from helper import benchmark_with_power, get_sm_version, log_perf
+
+
+def pad_up(x: int, y: int) -> int:
+    return ((x + y - 1) // y) * y
 
 
 def get_gemm_test_cases():
-    x_list = [
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-        48,
-        64,
-        80,
-        96,
-        128,
-        160,
-        192,
-        256,
-        384,
-        512,
-        768,
-        1024,
-        2048,
-        4096,
-        8192,
-    ]
-    nk_list = [
-        32,
-        64,
-        128,
-        256,
-        512,
-        768,
-        1024,
-        1536,
-        2048,
-        2560,
-        3072,
-        3584,
-        4096,
-        5120,
-        6144,
-        7168,
-        8192,
-        10240,
-        12288,
-    ]
-    nk_list_ext = [16384, 65536]  # for coverage and interp purpose
     gemm_list = ["float16"]
     if get_sm_version() > 86:
         gemm_list += ["fp8"]
@@ -66,16 +26,14 @@ def get_gemm_test_cases():
         gemm_list += ["nvfp4"]
 
     test_cases = []
-    for gemm_type in gemm_list:
-        # x_list_orig+add+ext  <==> nk_list+ext
-        for x in sorted(x_list, reverse=True):
-            for n in sorted(nk_list + nk_list_ext, reverse=True):
-                for k in sorted(nk_list + nk_list_ext, reverse=True):
-                    if n * k == 65536 * 65536:
-                        continue
-                    if (gemm_type == "nvfp4" or gemm_type == "fp8_block") and (n < 128 or k < 128):
-                        continue
-                    test_cases.append([gemm_type, x, n, k, "gemm_perf.txt"])
+    for gemm_common_testcase in get_gemm_common_test_cases():
+        x = gemm_common_testcase.x
+        n = gemm_common_testcase.n
+        k = gemm_common_testcase.k
+        for gemm_type in gemm_list:
+            if (gemm_type == "nvfp4" or gemm_type == "fp8_block") and (n < 128 or k < 128):
+                continue
+            test_cases.append([gemm_type, x, n, k, "gemm_perf.txt"])
 
     return test_cases
 
@@ -99,9 +57,9 @@ def run_gemm(gemm_type, m, n, k, perf_filename, device="cuda:0"):
     else:
         qc = None
 
-    repeat_n = 5  # to reduce impact of L2 cache hit
+    outside_loop_count = 5  # to reduce impact of L2 cache hit
     op_list = []
-    for i in range(repeat_n):
+    for i in range(outside_loop_count):
         gemm = Linear(
             k,
             n,
@@ -134,7 +92,14 @@ def run_gemm(gemm_type, m, n, k, perf_filename, device="cuda:0"):
             w = torch.randn((n, k), dtype=torch.float16, device=torch.device(device))
             w_sf_global = (448 * 6) / w.abs().max().float()
             w_fp4, w_sf_block = torch.ops.trtllm.fp4_quantize(w, w_sf_global, 16, False)
-            w_sf_block_unswizzled = torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(w_sf_block.cpu().view(k, -1))
+            if tensorrt_llm.__version__.startswith(("1.1.0", "1.2.0")):
+                w_sf_block_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+                    w_sf_block.cpu().view(pad_up(n, 128), -1)
+                )
+            else:
+                w_sf_block_unswizzled = torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(
+                    w_sf_block.cpu().view(k, -1)
+                )
             weights = {
                 "weight": w_fp4.cpu(),
                 "weight_scale": w_sf_block_unswizzled.view(torch.float8_e4m3fn),
@@ -149,33 +114,27 @@ def run_gemm(gemm_type, m, n, k, perf_filename, device="cuda:0"):
         gemm.forward(x)  # dry run to init
         op_list.append(gemm)
 
-    num_warmups = 3
-    num_runs = 6
-
-    # capture
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    # Use benchmark_with_power context manager
+    def kernel_func():
         for op in op_list:
             op.forward(x)
-    # warmup
-    for i in range(num_warmups):
-        g.replay()
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for i in range(num_runs):
-        g.replay()
-    end_event.record()
-    torch.cuda.synchronize()
-    latency = start_event.elapsed_time(end_event) / num_runs / len(op_list)
+    with benchmark_with_power(
+        device=device,
+        kernel_func=kernel_func,
+        repeat_n=1,  # Already repeating inside kernel_func via op_list
+    ) as results:
+        pass
 
     log_perf(
-        item_list=[{"gemm_dtype": gemm_type, "m": m, "n": n, "k": k, "latency": latency}],
+        item_list=[
+            {"gemm_dtype": gemm_type, "m": m, "n": n, "k": k, "latency": results["latency_ms"] / outside_loop_count}
+        ],
         framework="TRTLLM",
         version=tensorrt_llm.__version__,
         device_name=torch.cuda.get_device_name(device),
         op_name="gemm",
         kernel_source="torch_flow",
         perf_filename=perf_filename,
+        power_stats=results["power_stats"],
     )

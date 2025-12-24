@@ -204,7 +204,7 @@ ColumnsStatic = [
     "tokens/s",
     "tokens/s/gpu",
     "tokens/s/user",
-    "latency",
+    "request_latency",
     "context_latency",
     "generation_latency",
     "num_total_gpus",
@@ -223,6 +223,7 @@ ColumnsStatic = [
     "backend",
     "version",
     "system",
+    "power_w",  # NEW: E2E weighted average power in watts
 ]
 
 """
@@ -239,6 +240,7 @@ ColumnsAgg = [
     "global_bs",
     "ttft",
     "tpot",
+    "request_latency",
     "seq/s",
     "seq/s/gpu",
     "tokens/s",
@@ -266,6 +268,7 @@ ColumnsAgg = [
     "backend",
     "version",
     "system",
+    "power_w",  # NEW: E2E weighted average power in watts
 ]
 
 """
@@ -286,6 +289,7 @@ ColumnsDisagg = [
     "(d)workers",
     "ttft",
     "tpot",
+    "request_latency",
     "seq/s",
     "seq/s/gpu",
     "tokens/s",
@@ -324,17 +328,20 @@ ColumnsDisagg = [
     "(d)backend",
     "(d)version",
     "(d)system",
+    "power_w",  # NEW: E2E weighted average power in watts
 ]
 
 
-class SOLMode(Enum):
+class DatabaseMode(Enum):
     """
-    SOL mode for database.
+    Database mode.
     """
 
-    NON_SOL = 0
-    SOL = 1
-    SOL_FULL = 2
+    SILICON = 0  # default mode using silicon data
+    HYBRID = 1  # use silicon data when available, otherwise use SOL+empirical factor
+    EMPIRICAL = 2  # SOL+empirical factor
+    SOL = 3  # Provide SOL time only
+    SOL_FULL = 4  # Provide SOL time and details
 
 
 class BackendName(Enum):
@@ -367,8 +374,6 @@ class PerfDataFilename(Enum):
     wideep_generation_mla = "wideep_generation_mla_perf.txt"
     wideep_context_moe = "wideep_context_moe_perf.txt"
     wideep_generation_moe = "wideep_generation_moe_perf.txt"
-    wideep_context_mlp = "wideep_context_mlp_perf.txt"
-    wideep_generation_mlp = "wideep_generation_mlp_perf.txt"
     wideep_deepep_normal = "wideep_deepep_normal_perf.txt"
     wideep_deepep_ll = "wideep_deepep_ll_perf.txt"
 

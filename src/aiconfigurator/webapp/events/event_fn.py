@@ -17,6 +17,7 @@ from aiconfigurator.sdk.backends.factory import get_backend
 from aiconfigurator.sdk.inference_session import InferenceSession
 from aiconfigurator.sdk.models import check_is_moe, get_model, get_model_family
 from aiconfigurator.sdk.perf_database import get_all_databases, get_database
+from aiconfigurator.sdk.utils import enumerate_parallel_config
 
 
 class LogCapture:
@@ -46,8 +47,9 @@ def create_scatter_plot(df, x_col, y_col, title, is_disagg=False):
                 mode="lines+markers",
                 line=dict(color="red", width=2),
                 marker=dict(color="blue", size=8),
-                hovertemplate="<b>tokens/s/user:</b> %{x:.2f}<br>"
-                + "<b>tokens/s/gpu:</b> %{y:.2f}<br>"
+                hovertemplate="<b>tokens/s/user:</b> %{customdata[9]:.2f}<br>"
+                + "<b>tokens/s/gpu:</b> %{customdata[10]:.2f}<br>"
+                + "<b>request latency(ms):</b> %{customdata[8]:.2f}<br>"
                 + "<b>TTFT(ms):</b> %{customdata[0]:.2f}<br>"
                 + "<b>TPOT(ms):</b> %{customdata[1]:.2f}<br>"
                 + "<b>seq/s (system):</b> %{customdata[2]:.2f}<br>"
@@ -66,6 +68,9 @@ def create_scatter_plot(df, x_col, y_col, title, is_disagg=False):
                         df["memory"],
                         df["num_total_gpus"],
                         df["index"],
+                        df["request_latency"],
+                        df["tokens/s/user"],
+                        df["tokens/s/gpu"],
                     ),
                     axis=1,
                 ),
@@ -79,8 +84,9 @@ def create_scatter_plot(df, x_col, y_col, title, is_disagg=False):
                 mode="lines+markers",
                 line=dict(color="red", width=2),
                 marker=dict(color="blue", size=8),
-                hovertemplate="<b>tokens/s/user:</b> %{x:.2f}<br>"
-                + "<b>tokens/s/gpu:</b> %{y:.2f}<br>"
+                hovertemplate="<b>tokens/s/user:</b> %{customdata[19]:.2f}<br>"
+                + "<b>tokens/s/gpu:</b> %{customdata[20]:.2f}<br>"
+                + "<b>request latency(ms):</b> %{customdata[18]:.2f}<br>"
                 + "<b>TTFT(ms):</b> %{customdata[0]:.2f}<br>"
                 + "<b>TPOT(ms):</b> %{customdata[1]:.2f}<br>"
                 + "<b>seq/s (system):</b> %{customdata[2]:.2f}<br>"
@@ -119,6 +125,9 @@ def create_scatter_plot(df, x_col, y_col, title, is_disagg=False):
                         df["concurrency"],
                         df["num_total_gpus"],
                         df["index"],
+                        df["request_latency"],
+                        df["tokens/s/user"],
+                        df["tokens/s/gpu"],
                     ),
                     axis=1,
                 ),
@@ -151,7 +160,7 @@ class EventFn:
         system_name,
         backend_name,
         version,
-        sol_mode,
+        database_mode,
         batch_size,
         isl,
         osl,
@@ -184,7 +193,7 @@ class EventFn:
             try:
                 database = copy.deepcopy(get_database(system_name, backend_name, version))
                 assert database is not None
-                database.set_default_sol_mode(common.SOLMode(int(sol_mode)))
+                database.set_default_database_mode(common.DatabaseMode[database_mode])
                 nextn_accept_rates = [float(x) for x in nextn_accept_rates.split(",")]
                 model_config = config.ModelConfig(
                     tp_size=tp_size,
@@ -249,7 +258,7 @@ class EventFn:
         system_name,
         backend_name,
         version,
-        sol_mode,
+        database_mode,
         isl,
         osl,
         prefix,
@@ -280,7 +289,7 @@ class EventFn:
             try:
                 database = get_database(system_name, backend_name, version)
                 assert database is not None
-                database.set_default_sol_mode(common.SOLMode(int(sol_mode)))
+                database.set_default_database_mode(common.DatabaseMode[database_mode])
                 nextn_accept_rates = [float(x) for x in nextn_accept_rates.split(",")]
                 model_config = config.ModelConfig(
                     tp_size=tp_size,
@@ -302,7 +311,7 @@ class EventFn:
                 runtime_config = config.RuntimeConfig(isl=isl, osl=osl, prefix=prefix, ttft=ttft, tpot=tpot)
 
                 is_moe = check_is_moe(model_name)
-                parallel_config_list = pareto_analysis.enumerate_parallel_config(
+                parallel_config_list = enumerate_parallel_config(
                     num_gpu_list=[tp_size * pp_size * dp_size],
                     tp_list=[tp_size],
                     pp_list=[pp_size],
@@ -359,11 +368,12 @@ class EventFn:
         system_name,
         backend_name,
         version,
-        sol_mode,
+        database_mode,
         isl,
         osl,
         prefix,
         ttft,
+        request_latency,
         num_gpus,
         tp_size,
         pp_size,
@@ -391,7 +401,7 @@ class EventFn:
             try:
                 database = copy.deepcopy(get_database(system_name, backend_name, version))
                 assert database is not None
-                database.set_default_sol_mode(common.SOLMode(int(sol_mode)))
+                database.set_default_database_mode(common.DatabaseMode[database_mode])
                 nextn_accept_rates = [float(x) for x in nextn_accept_rates.split(",")]
                 model_config = config.ModelConfig(
                     gemm_quant_mode=common.GEMMQuantMode[gemm_quant_mode],
@@ -411,10 +421,11 @@ class EventFn:
                     prefix=prefix,
                     ttft=ttft,
                     tpot=list(range(2, 20, 1)) + list(range(20, 300, 5)),
+                    request_latency=request_latency if request_latency and request_latency > 0 else None,
                 )
 
                 is_moe = check_is_moe(model_name)
-                parallel_config_list = pareto_analysis.enumerate_parallel_config(
+                parallel_config_list = enumerate_parallel_config(
                     num_gpu_list=num_gpus,
                     tp_list=tp_size,
                     pp_list=pp_size,
@@ -447,7 +458,15 @@ class EventFn:
                     parallel_config_list=parallel_config_list,
                 )
 
-                results_df = pareto_analysis.get_pareto_front(results_df, "tokens/s/user", "tokens/s/gpu")
+                # Use request_latency as x-axis if request_latency mode is active
+                if runtime_config.request_latency and runtime_config.request_latency > 0:
+                    x_col = "request_latency"
+                    # For request_latency: minimize x (lower latency is better), maximize y
+                    results_df = pareto_analysis.get_pareto_front(results_df, x_col, "tokens/s/gpu", maximize_x=False)
+                else:
+                    x_col = "tokens/s/user"
+                    results_df = pareto_analysis.get_pareto_front(results_df, x_col, "tokens/s/gpu")
+
                 results_df = results_df.reset_index(drop=True).reset_index()
                 if results_df.size == 0:
                     logger.error(
@@ -455,14 +474,19 @@ class EventFn:
                         f"ttft {ttft}ms and memory size. Try to set a larger ttft limit and use "
                         "more GPUs."
                     )
+                latency_info = (
+                    f"_reqlat{runtime_config.request_latency}"
+                    if runtime_config.request_latency
+                    else f"_ttft{runtime_config.ttft}"
+                )
                 title = (
-                    f"{model_name}_isl{runtime_config.isl}_osl{runtime_config.osl}_prefix{runtime_config.prefix}_ttft"
-                    f"{runtime_config.ttft}_{system_name}_{backend_name}_{version}_"
+                    f"{model_name}_isl{runtime_config.isl}_osl{runtime_config.osl}_prefix{runtime_config.prefix}"
+                    f"{latency_info}_{system_name}_{backend_name}_{version}_"
                     f"{model_config.gemm_quant_mode}_{model_config.kvcache_quant_mode}_"
                     f"{model_config.fmha_quant_mode}_{model_config.moe_quant_mode}_"
                     f"{model_config.comm_quant_mode}_Agg_Pareto"
                 )
-                pareto_html = create_scatter_plot(results_df, "tokens/s/user", "tokens/s/gpu", title)
+                pareto_html = create_scatter_plot(results_df, x_col, "tokens/s/gpu", title)
             except Exception:
                 results_df = pd.DataFrame(columns=common.ColumnsAgg)
                 traceback_log = traceback.format_exc()
@@ -493,13 +517,14 @@ class EventFn:
         osl,
         prefix,
         ttft,
+        request_latency,
         nextn,
         nextn_accept_rates,
         enable_wideep,
         prefill_system_name,
         prefill_backend_name,
         prefill_version,
-        prefill_sol_mode,
+        prefill_database_mode,
         prefill_num_worker,
         prefill_num_gpus,
         prefill_tp_size,
@@ -516,7 +541,7 @@ class EventFn:
         decode_system_name,
         decode_backend_name,
         decode_version,
-        decode_sol_mode,
+        decode_database_mode,
         decode_num_worker,
         decode_num_gpus,
         decode_tp_size,
@@ -553,8 +578,8 @@ class EventFn:
                 decode_database = copy.deepcopy(get_database(decode_system_name, decode_backend_name, decode_version))
                 assert prefill_database is not None
                 assert decode_database is not None
-                prefill_database.set_default_sol_mode(common.SOLMode(int(prefill_sol_mode)))
-                decode_database.set_default_sol_mode(common.SOLMode(int(decode_sol_mode)))
+                prefill_database.set_default_database_mode(common.DatabaseMode[prefill_database_mode])
+                decode_database.set_default_database_mode(common.DatabaseMode[prefill_database_mode])
                 nextn_accept_rates = [float(x) for x in nextn_accept_rates.split(",")]
                 prefill_model_config = config.ModelConfig(
                     tp_size=prefill_tp_size,
@@ -596,11 +621,12 @@ class EventFn:
                     prefix=prefix,
                     ttft=ttft,
                     tpot=list(range(1, 20, 1)) + list(range(20, 300, 5)),
+                    request_latency=request_latency if request_latency and request_latency > 0 else None,
                 )
 
                 is_moe = check_is_moe(model_name)
 
-                prefill_parallel_config_list = pareto_analysis.enumerate_parallel_config(
+                prefill_parallel_config_list = enumerate_parallel_config(
                     num_gpu_list=prefill_num_gpus,
                     tp_list=prefill_tp_size,
                     pp_list=prefill_pp_size,
@@ -611,7 +637,7 @@ class EventFn:
                     backend=common.BackendName(prefill_backend_name),
                     enable_wideep=enable_wideep,
                 )
-                decode_parallel_config_list = pareto_analysis.enumerate_parallel_config(
+                decode_parallel_config_list = enumerate_parallel_config(
                     num_gpu_list=decode_num_gpus,
                     tp_list=decode_tp_size,
                     pp_list=decode_pp_size,
@@ -627,7 +653,7 @@ class EventFn:
                     tp, pp, dp, moe_tp, moe_ep = prefill_parallel_config
                     if is_moe:
                         logger.info(
-                            f"enumerated prefill config: tp {tp} pp {pp} dp {dp} moe_tp {moe_tp} moe_ep {{moe_ep}}"
+                            f"enumerated prefill config: tp {tp} pp {pp} dp {dp} moe_tp {moe_tp} moe_ep {moe_ep}"
                         )
                     else:
                         logger.info(f"enumerated prefill config: tp {tp} pp {pp}")
@@ -636,7 +662,7 @@ class EventFn:
                     tp, pp, dp, moe_tp, moe_ep = decode_parallel_config
                     if is_moe:
                         logger.info(
-                            f"enumerated decode config: tp {tp} pp {pp} dp {dp} moe_tp {moe_tp} moe_ep {{moe_ep}}"
+                            f"enumerated decode config: tp {tp} pp {pp} dp {dp} moe_tp {moe_tp} moe_ep {moe_ep}"
                         )
                     else:
                         logger.info(f"enumerated decode config: tp {tp} pp {pp}")
@@ -679,24 +705,37 @@ class EventFn:
                     decode_max_num_tokens=decode_max_batch_size,
                 )
 
-                results_df = pareto_analysis.get_pareto_front(results_df, "tokens/s/user", "tokens/s/gpu")
+                # Use request_latency as x-axis if request_latency mode is active
+                if runtime_config.request_latency and runtime_config.request_latency > 0:
+                    x_col = "request_latency"
+                    # For request_latency: minimize x (lower latency is better), maximize y
+                    results_df = pareto_analysis.get_pareto_front(results_df, x_col, "tokens/s/gpu", maximize_x=False)
+                else:
+                    x_col = "tokens/s/user"
+                    results_df = pareto_analysis.get_pareto_front(results_df, x_col, "tokens/s/gpu")
+
                 results_df = results_df.reset_index(drop=True).reset_index()
                 if results_df.size == 0:
                     logger.error(
                         f"No result for {model_name} under this restriction ttft {ttft}ms and "
                         "memory size. Try to set a larger ttft limit and use more GPUs."
                     )
+                latency_info = (
+                    f"_reqlat{runtime_config.request_latency}"
+                    if runtime_config.request_latency
+                    else f"_ttft{runtime_config.ttft}"
+                )
                 title = (
-                    f"{model_name}_isl{runtime_config.isl}_osl{runtime_config.osl}_prefix{runtime_config.prefix}_ttft"
-                    f"{runtime_config.ttft}_prefill_{prefill_system_name}_{prefill_backend_name}_"
-                    f"{prefill_version}_{prefill_sol_mode}_{prefill_gemm_quant_mode}_"
+                    f"{model_name}_isl{runtime_config.isl}_osl{runtime_config.osl}_prefix{runtime_config.prefix}"
+                    f"{latency_info}_prefill_{prefill_system_name}_{prefill_backend_name}_"
+                    f"{prefill_version}_{prefill_database_mode}_{prefill_gemm_quant_mode}_"
                     f"{prefill_kvcache_quant_mode}_{prefill_fmha_quant_mode}_{prefill_moe_quant_mode}_"
                     f"{prefill_comm_quant_mode}_decode_{decode_system_name}_{decode_backend_name}_"
-                    f"{decode_version}_{decode_sol_mode}_{decode_gemm_quant_mode}_"
+                    f"{decode_version}_{decode_database_mode}_{decode_gemm_quant_mode}_"
                     f"{decode_kvcache_quant_mode}_{decode_fmha_quant_mode}_{decode_moe_quant_mode}_"
                     f"{decode_comm_quant_mode}_Disagg_Pareto"
                 )
-                pareto_html = create_scatter_plot(results_df, "tokens/s/user", "tokens/s/gpu", title, is_disagg=True)
+                pareto_html = create_scatter_plot(results_df, x_col, "tokens/s/gpu", title, is_disagg=True)
             except Exception:
                 results_df = pd.DataFrame(columns=common.ColumnsDisagg)
                 traceback_log = traceback.format_exc()
@@ -733,7 +772,7 @@ class EventFn:
         prefill_system_name,
         prefill_backend_name,
         prefill_version,
-        prefill_sol_mode,
+        prefill_database_mode,
         prefill_tp_size,
         prefill_pp_size,
         prefill_dp_size,
@@ -747,7 +786,7 @@ class EventFn:
         decode_system_name,
         decode_backend_name,
         decode_version,
-        decode_sol_mode,
+        decode_database_mode,
         decode_tp_size,
         decode_pp_size,
         decode_dp_size,
@@ -868,7 +907,7 @@ class EventFn:
                     get_database(prefill_system_name, prefill_backend_name, prefill_version)
                 )
                 assert prefill_database is not None
-                prefill_database.set_default_sol_mode(common.SOLMode(int(prefill_sol_mode)))
+                prefill_database.set_default_database_mode(common.DatabaseMode[prefill_database_mode])
                 prefill_backend = get_backend(prefill_backend_name)
                 prefill_session = InferenceSession(prefill_model, prefill_database, prefill_backend)
                 prefill_results_df = pd.DataFrame(columns=common.ColumnsStatic)
@@ -886,7 +925,7 @@ class EventFn:
                 prefill_results_df = prefill_results_df.reset_index(drop=True).reset_index()
                 title = (
                     f"{model_name}_isl{isl}_osl{osl}_prefix{prefix}_prefill_{prefill_system_name}_"
-                    f"{prefill_backend_name}_{prefill_version}_{prefill_sol_mode}_"
+                    f"{prefill_backend_name}_{prefill_version}_{prefill_database_mode}_"
                     f"{prefill_gemm_quant_mode}_{prefill_kvcache_quant_mode}_"
                     f"{prefill_fmha_quant_mode}_{prefill_moe_quant_mode}_{prefill_comm_quant_mode}_"
                     "Throughput"
@@ -904,7 +943,7 @@ class EventFn:
                 decode_model = get_model(model_name, decode_model_config, decode_backend_name)
                 decode_database = copy.deepcopy(get_database(decode_system_name, decode_backend_name, decode_version))
                 assert decode_database is not None
-                decode_database.set_default_sol_mode(common.SOLMode(int(decode_sol_mode)))
+                decode_database.set_default_database_mode(common.DatabaseMode[decode_database_mode])
                 decode_backend = get_backend(decode_backend_name)
                 decode_session = InferenceSession(decode_model, decode_database, decode_backend)
                 decode_results_df = pd.DataFrame(columns=common.ColumnsStatic)
@@ -934,7 +973,7 @@ class EventFn:
                 decode_results_df = decode_results_df.reset_index(drop=True).reset_index()
                 title = (
                     f"{model_name}_isl{isl}_osl{osl}_decode_{decode_system_name}_"
-                    f"{decode_backend_name}_{decode_version}_{decode_sol_mode}_"
+                    f"{decode_backend_name}_{decode_version}_{decode_database_mode}_"
                     f"{decode_gemm_quant_mode}_{decode_kvcache_quant_mode}_"
                     f"{decode_fmha_quant_mode}_{decode_moe_quant_mode}_{decode_comm_quant_mode}_"
                     "Throughput"
@@ -1014,6 +1053,11 @@ class EventFn:
             "magenta",
         ]
         fig = go.Figure()
+
+        # Detect if any result uses request_latency mode (check if "reqlat" in result name)
+        use_request_latency_mode = any("reqlat" in name.lower() for name in candidates_dropdown)
+        x_col = "request_latency" if use_request_latency_mode else "tokens/s/user"
+
         for i, result_name in enumerate(candidates_dropdown):
             result_df = pareto_results_state[result_name]
             if "parallel" in result_df.columns:
@@ -1026,15 +1070,16 @@ class EventFn:
                 memory = "(p)" + result_df["(p)memory"].astype(str) + "_(d)" + result_df["(d)memory"].astype(str)
             fig.add_trace(
                 go.Scatter(
-                    x=result_df["tokens/s/user"],
+                    x=result_df[x_col],
                     y=result_df["tokens/s/gpu"],
                     mode="lines+markers",
                     name=result_name,
                     line=dict(color=color_list[i % len(color_list)], width=2),
                     marker=dict(color=color_list[i % len(color_list)], size=8),
                     hovertemplate=f"<b>system type:</b> {system_type}<br>"
-                    + "<b>tokens/s/user:</b> %{x:.2f}<br>"
-                    + "<b>tokens/s/gpu:</b> %{y:.2f}<br>"
+                    + "<b>tokens/s/user:</b> %{customdata[8]:.2f}<br>"
+                    + "<b>tokens/s/gpu:</b> %{customdata[9]:.2f}<br>"
+                    + "<b>request latency(ms):</b> %{customdata[10]:.2f}<br>"
                     + "<b>TTFT(ms):</b> %{customdata[0]:.2f}<br>"
                     + "<b>TPOT(ms):</b> %{customdata[1]:.2f}<br>"
                     + "<b>seq/s (system):</b> %{customdata[2]:.2f}<br>"
@@ -1053,6 +1098,9 @@ class EventFn:
                             memory,
                             result_df["num_total_gpus"],
                             result_df["index"],
+                            result_df["tokens/s/user"],
+                            result_df["tokens/s/gpu"],
+                            result_df["request_latency"],
                         ),
                         axis=1,
                     ),
@@ -1068,7 +1116,7 @@ class EventFn:
                 "yanchor": "top",
             },
             xaxis_title={
-                "text": "tokens/s/user",
+                "text": x_col,
                 "font": dict(size=14, family="Arial, sans-serif"),
             },
             yaxis_title={"text": "tokens/s/gpu", "font": dict(size=14, family="Arial, sans-serif")},
@@ -1111,10 +1159,10 @@ class EventFn:
         else:
             if backend_name == "sglang":
                 if enable_wideep:
-                    gemm_quant_mode_choices = sorted(supported_quant_mode["wideep_context_mlp"])
+                    gemm_quant_mode_choices = sorted(supported_quant_mode["gemm"])
                     kvcache_quant_mode_choices = sorted(supported_quant_mode["wideep_generation_mla"])
                     fmha_quant_mode_choices = sorted(supported_quant_mode["wideep_context_mla"])
-                    moe_quant_mode_choices = sorted(supported_quant_mode["wideep_context_mlp"])
+                    moe_quant_mode_choices = sorted(supported_quant_mode["wideep_context_moe"])
                 else:
                     gemm_quant_mode_choices = sorted(supported_quant_mode["gemm"])
                     kvcache_quant_mode_choices = sorted(supported_quant_mode["generation_mla"])

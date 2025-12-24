@@ -63,10 +63,17 @@ aiconfigurator cli default --model QWEN3_32B --total_gpus 32 --system h200_sxm
 aiconfigurator cli exp --yaml_path exp.yaml
 ```
 - We have two modes, `default` and `exp`.
-- Use `default`, followed with **three basic arguments**, it prints the estimated best deployment and the deployment details.
+- Use `default`, followed with **three basic arguments** (model, total_gpus, system), it prints the estimated best deployment and the deployment details.
+- Use `--backend` to specify the inference backend: `trtllm` (default), `vllm`, or `sglang`.
 - Use `exp`, pass in exp.yaml by `--yaml_path` to customize your experiments and even a heterogenous one.
 - Use `--save_dir DIR` to generate framework configuration files for Dynamo.
+- Use `--database_mode` to control performance estimation mode: `SILICON` (default, uses collected silicon data), `HYBRID` (uses silicon data when available, otherwise SOL+empirical), `EMPIRICAL` (SOL+empirical for all), or `SOL` (speed-of-light only).
 - Use `-h` for more options and customization.
+- SLA constraints:
+  - `--ttft` and `--tpot` filter configurations that exceed either bound; omit a flag to leave that constraint unset.
+  - `--request_latency` applies an end-to-end per-request limit. The CLI searches for all configurations whose estimated 
+  latency stays within that budget, optionally honoring a provided `--ttft`. 
+  When this flag is set, `--tpot` becomes implicit and is ignored.
 
 Refer to [CLI User Guide](docs/cli_user_guide.md)
 
@@ -171,7 +178,6 @@ Refer to the YAML file and modify as needed. Pass your customized YAML file to `
 ```bash
 aiconfigurator cli exp --yaml_path customized_config.yaml
 ```
-
 We can use `exp` mode to compare multiple results, including disagg vs. agg, homegenous vs. heterogenous, and more than 2 experiments. 
 We've crafted several examples in `src/aiconfigurator/cli/exps/*.yaml`  
 For the full guide, refer to [CLI User Guide](docs/cli_user_guide.md).
@@ -211,6 +217,13 @@ results/QWEN3_32B_isl4000_osl1000_ttft1000_tpot20_904495
 │   ...
 └── pareto_frontier.png
 ```
+
+Use `--generator-config path/to/file.yaml` to load a YAML payload with `ServiceConfig`, `K8sConfig`, and `Workers.*` sections, or specify inline overrides with `--generator-set KEY=VALUE` (repeatable). Examples:
+
+- `--generator-set ServiceConfig.model_path=Qwen/Qwen3-32B-FP8`
+- `--generator-set K8sConfig.k8s_namespace=dynamo \`
+
+Run `aiconfigurator cli default --generator-help` to print information that is sourced directly from `src/aiconfigurator/generator/config/deployment_config.yaml` and `backend_config_mapping.yaml`. 
 
 ### All-in-one automation
 
@@ -253,14 +266,15 @@ To estimate performance, we take the following steps:
 
 ### Supported Features
 
-- Models:
+- **Models**:
   - GPT
   - LLAMA (2, 3)
   - MOE
   - QWEN
   - DEEPSEEK_V3
   - Support using huggingface model id if falls into these model family and not MoE models.
-- Operations:
+
+- **Operations**:
   - Attention
     - MHA/GQA (FP8, FP16)
     - MLA (FP8, FP16)
@@ -273,20 +287,23 @@ To estimate performance, we take the following steps:
   - NCCL (all_reduce, all_gather, all-to-all, reduce_scatter)
   - MoE (FP16, FP8, FP8-Block, W4A-FP8, INT4 WO, NVFP4)
   - MLA BMM (FP16, FP8)
-- Parallel modes:
+
+- **Parallel modes**:
   - Tensor-parallel
   - Pipeline-parallel
   - Expert Tensor-parallel/Expert-parallel
   - Attention DP (for DEEPSEEK and MoE)
-- Scheduling:
+
+- **Scheduling**:
   - Static
   - Aggregated serving (continuous batching)
   - Disaggregated serving
   - MTP (for DEEPSEEK)
-- Backends:
-  - TRTLLM (regular)
-  - SGLang (WideEP and regular)
-  - vLLM (regular with dense models; Non-moe support for now)
+
+- **Inference Backends**:
+  - TensorRT-LLM (trtllm)
+  - vLLM
+  - SGLang
 
 ### Data Collection
 
@@ -295,17 +312,23 @@ Small changes to the database may not materially change performance estimates. F
 
 To go through the process, refer to the [guidance](collector/README.md) under the `collector` folder.
 
+**New:** The collector now supports optional GPU power monitoring during kernel execution. Use the `--measure_power` flag to collect power consumption data alongside performance metrics. See the [collector README](collector/README.md#power-monitoring-optional) for details.
+
 ### System Data Support Matrix
 
 | System | Framework(Version) | Status |
 |--------|-------------------|--------|
-| h100_sxm | TRTLLM(0.20.0, 1.0.0rc3), SGLang(0.5.1.post1), vLLM(0.11.0) | ✅ |
-| h200_sxm | TRTLLM(0.20.0, 1.0.0rc3), SGLang(0.5.1.post1), vLLM(0.11.0) | ✅ |
+| h100_sxm | TRTLLM(0.20.0, 1.0.0rc3), SGLang(0.5.5.post2, 0.5.5.post3), vLLM(0.11.0) | ✅ |
+| h200_sxm | TRTLLM(0.20.0, 1.0.0rc3), SGLang(0.5.5.post2, 0.5.5.post3), vLLM(0.11.0) | ✅ |
 | b200_sxm | TRTLLM(1.0.0rc6) | ✅ |
 | gb200_sxm | TRTLLM(1.0.0rc6) | ✅ |
 | a100_sxm | TRTLLM(1.0.0) | ✅ |
 
-> **Note**: b200 and gb200 are under dev. Results are to be aligned. For preview now. 
+> **Note**: b200 and gb200 are under dev. Results are to be aligned. For preview now.
+
+#### Detailed Support Matrix
+
+For a comprehensive breakdown of which model/system/backend/version combinations are supported in both aggregated and disaggregated modes, refer to the [**support matrix CSV**](src/aiconfigurator/systems/support_matrix.csv). This file is automatically generated and tested to ensure accuracy across all supported configurations.
 
 ## Contributing and Development
 
@@ -321,6 +344,6 @@ Adding a new model will require modifying the source code and perhaps collecting
 
 1. Memory estimation for the backends needs to be studied more.
 2. Results can be overly optimistic in the low-speed, high-throughput region.
-3. SGLang and vLLM support is the initial version, needs more alignment in future.
+3. **vLLM and SGLang support is currently being evaluated**. While both backends are functional and available for use, we are still completing comprehensive performance evaluations and alignment testing. We recommend validating results with real benchmarks for production use.
 
 > **Note**: The results are not final or absolute. They can be inaccurate due to modeling gaps or indicate performance improvement opportunities. The tool aims to align with the framework's current implementation and to provide configuration suggestions. Verify results in real benchmarks with the generated configurations and perform follow-up tuning.

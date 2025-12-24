@@ -4,11 +4,15 @@
 import fcntl
 import json
 import logging
+import math
 import multiprocessing as mp
 import os
 import signal
 import sys
+import threading
+import time
 import traceback
+
 import csv
 import time
 
@@ -16,8 +20,364 @@ import time
 #     from cuda import cuda
 # except:
 #     from cuda.bindings import driver as cuda
+
+from contextlib import contextmanager
+
 from datetime import datetime
 from pathlib import Path
+
+# Exit codes
+EXIT_CODE_RESTART = 10  # Exit code to indicate restart is needed
+
+# Global NVML state per worker process
+_NVML_INITIALIZED = False
+_NVML_LOCK = threading.Lock()
+
+
+def _parse_bool_env(env_var: str, default: bool = False) -> bool:
+    """
+    Robustly parse boolean environment variables.
+
+    Accepts: "true", "True", "TRUE", "1", "yes", "Yes", "YES"
+    Rejects: "false", "False", "FALSE", "0", "no", "No", "NO", or unset
+
+    Args:
+        env_var: Environment variable name to read
+        default: Default value if variable is not set
+
+    Returns:
+        Boolean value
+    """
+    value = os.environ.get(env_var)
+    if value is None:
+        return default
+    return value.lower() in ("true", "1", "yes")
+
+
+def _ensure_nvml_initialized():
+    """Initialize NVML once per process. Thread-safe."""
+    global _NVML_INITIALIZED
+    with _NVML_LOCK:
+        if not _NVML_INITIALIZED:
+            try:
+                import pynvml as nvml
+
+                nvml.nvmlInit()
+                _NVML_INITIALIZED = True
+                logging.getLogger(__name__).info("NVML initialized for power monitoring")
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"Failed to initialize NVML: {e}")
+                return False
+        return _NVML_INITIALIZED
+
+
+class PowerMonitor:
+    """
+    Background thread that samples GPU power using NVML at 100ms intervals.
+    Designed to be reusable across multiple kernel runs within a worker process.
+    """
+
+    SAMPLE_INTERVAL_MS = 100  # Fixed sampling interval
+
+    def __init__(self, device_id: int):
+        """
+        Args:
+            device_id: CUDA device index to monitor
+        """
+        self.device_id = device_id
+        self.interval_s = self.SAMPLE_INTERVAL_MS / 1000.0
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._samples = []  # List of (timestamp, power_mw) tuples
+        self._lock = threading.Lock()
+        self._nvml_handle = None
+        self._power_limit_mw = None
+        self._is_initialized = False
+
+    def _init_handle(self):
+        """Get NVML handle (called once, cached)."""
+        if self._is_initialized:
+            return True
+
+        if not _ensure_nvml_initialized():
+            return False
+
+        try:
+            import pynvml as nvml
+
+            self._nvml_handle = nvml.nvmlDeviceGetHandleByIndex(self.device_id)
+            self._power_limit_mw = nvml.nvmlDeviceGetPowerManagementLimit(self._nvml_handle)
+            self._is_initialized = True
+            return True
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Failed to get NVML handle for device {self.device_id}: {e}")
+            return False
+
+    def start_sampling(self):
+        """Start background sampling thread."""
+        if not self._init_handle():
+            return False
+
+        # Clear previous samples
+        with self._lock:
+            self._samples.clear()
+
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._monitoring_loop, daemon=True)
+        self._thread.start()
+        return True
+
+    def stop_sampling(self) -> dict | None:
+        """Stop sampling and return statistics."""
+        if self._thread is None:
+            return None
+
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
+        self._thread = None
+
+        # Calculate statistics
+        with self._lock:
+            if not self._samples:
+                return None
+            power_values_w = [p_mw / 1000.0 for _, p_mw in self._samples]
+
+        import numpy as np
+
+        return {
+            "power": float(np.mean(power_values_w)),
+            "power_limit": float(self._power_limit_mw / 1000.0) if self._power_limit_mw else None,
+        }
+
+    def _monitoring_loop(self):
+        """Background thread function that samples power every 100ms."""
+        import pynvml as nvml
+
+        while not self._stop_event.is_set():
+            try:
+                timestamp = time.time()
+                power_mw = nvml.nvmlDeviceGetPowerUsage(self._nvml_handle)
+
+                with self._lock:
+                    self._samples.append((timestamp, power_mw))
+            except Exception:
+                # Skip failed samples silently
+                pass
+
+            # Wait for next interval
+            self._stop_event.wait(self.interval_s)
+
+
+@contextmanager
+def benchmark_with_power(
+    device,
+    kernel_func,
+    num_warmups: int = 3,
+    num_runs: int = 6,
+    repeat_n: int = 1,  # Default 1; GEMM files use 5
+    measure_power: bool | None = None,  # Auto-detect from environment if None
+    power_min_duration: float | None = None,  # Auto-detect from environment if None
+    allow_graph_fail: bool = False,  # NEW: Enable graceful fallback on graph capture failure
+):
+    """
+    Context manager that handles warmup, graph capture, timing, and power monitoring.
+
+    Args:
+        device: torch.device object
+        kernel_func: Callable that executes the kernel (e.g., lambda: gemm_op())
+        num_warmups: Number of warmup iterations
+        num_runs: Base number of runs (adjusted if measure_power=True)
+        repeat_n: Number of repetitions per graph replay
+        measure_power: Enable power monitoring (None = auto-detect from env)
+        power_min_duration: Minimum duration for power measurement (None = auto-detect from env)
+        allow_graph_fail: If True, gracefully fallback to eager execution when
+                         CUDA graph capture fails. Power monitoring continues
+                         to work in both paths. Default False for backward compatibility.
+
+    Yields:
+        dict with keys:
+            - 'latency_ms': Average latency in milliseconds
+            - 'power_stats': Dict with power/power_limit (or None)
+            - 'throttled': Boolean indicating if GPU was throttled
+            - 'num_runs_executed': Actual number of runs performed
+            - 'used_cuda_graph': Boolean indicating if graph was used
+    """
+    import torch
+
+    # Auto-detect configuration from environment if not explicitly provided
+    if measure_power is None:
+        measure_power = _parse_bool_env("COLLECTOR_MEASURE_POWER", default=False)
+    if power_min_duration is None:
+        power_min_duration = float(os.environ.get("COLLECTOR_POWER_MIN_DURATION", "1.0"))
+
+    # Adaptive num_runs calculation
+    actual_num_runs = num_runs
+    if measure_power:
+        # Estimate single iteration time with warmup
+        start_warmup = torch.cuda.Event(enable_timing=True)
+        end_warmup = torch.cuda.Event(enable_timing=True)
+
+        torch.cuda.synchronize()
+        start_warmup.record()
+        for _ in range(num_warmups):
+            kernel_func()
+        end_warmup.record()
+        torch.cuda.synchronize()
+
+        single_iter_time = start_warmup.elapsed_time(end_warmup) / num_warmups / 1000.0  # seconds
+
+        # Adaptive duration: use shorter duration for very fast kernels to reduce memory pressure
+        target_duration = power_min_duration
+        if single_iter_time < 0.0001:  # < 0.1ms
+            target_duration = min(power_min_duration, 0.3)
+        actual_num_runs = max(num_runs, int(target_duration / (single_iter_time * repeat_n)) + 1)
+        actual_num_runs = min(actual_num_runs, 3000)
+
+        if actual_num_runs > 1000:
+            logging.getLogger(__name__).warning(
+                f"Kernel is very fast ({single_iter_time * 1000:.3f}ms), running {actual_num_runs} iterations"
+            )
+    else:
+        # Normal warmup
+        torch.cuda.synchronize()
+        for _ in range(num_warmups):
+            kernel_func()
+        torch.cuda.synchronize()
+
+    # ═══════════════════════════════════════════════════════════════════
+    # CUDA Graph Capture with Optional Fallback
+    # ═══════════════════════════════════════════════════════════════════
+    use_graph = True
+    g = torch.cuda.CUDAGraph()
+
+    try:
+        with torch.cuda.graph(g):
+            for _ in range(repeat_n):
+                kernel_func()
+        torch.cuda.synchronize()
+    except Exception as e:
+        if allow_graph_fail:
+            logging.getLogger(__name__).warning(f"CUDA graph capture failed: {e}. Falling back to eager execution.")
+            torch.cuda.empty_cache()  # CRITICAL: Clean up partial allocations
+            use_graph = False
+        else:
+            # Standard behavior: re-raise exception
+            raise
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Warmup the ACTUAL execution path (after graph capture)
+    # ═══════════════════════════════════════════════════════════════════
+    torch.cuda.synchronize()
+    for _ in range(num_warmups):
+        if use_graph:
+            g.replay()
+        else:
+            # Fallback: Direct execution matching actual execution path
+            for _ in range(repeat_n):
+                kernel_func()
+    torch.cuda.synchronize()
+
+    # Initialize power monitor if enabled
+    power_monitor = None
+    power_stats = None
+    if measure_power:
+        power_monitor = PowerMonitor(device.index)
+        if not power_monitor.start_sampling():
+            power_monitor = None  # Failed to start
+
+    # Get initial clock info for throttling detection
+    initial_clocks = None
+    if measure_power and _NVML_INITIALIZED:
+        try:
+            import pynvml as nvml
+
+            handle = nvml.nvmlDeviceGetHandleByIndex(device.index)
+            initial_clocks = nvml.nvmlDeviceGetClockInfo(handle, nvml.NVML_CLOCK_SM)
+        except Exception:
+            pass
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Execute with Graph or Eager (both paths measured!)
+    # ═══════════════════════════════════════════════════════════════════
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start_event.record()
+    for _ in range(actual_num_runs):
+        if use_graph:
+            g.replay()
+        else:
+            # Fallback: Direct execution
+            # This matches SGLang/VLLM pattern where kernel_func handles internal loops
+            for _ in range(repeat_n):
+                kernel_func()
+    end_event.record()
+    torch.cuda.synchronize()
+
+    # Check for throttling
+    throttled = False
+    if initial_clocks is not None:
+        try:
+            import pynvml as nvml
+
+            handle = nvml.nvmlDeviceGetHandleByIndex(device.index)
+            final_clocks = nvml.nvmlDeviceGetClockInfo(handle, nvml.NVML_CLOCK_SM)
+            # If clocks dropped by more than 10%, likely throttled
+            if final_clocks < initial_clocks * 0.9:
+                throttled = True
+                logging.getLogger(__name__).warning(
+                    f"Clock throttling detected: {initial_clocks}MHz -> {final_clocks}MHz"
+                )
+        except Exception:
+            pass
+
+    # Stop power monitoring
+    if power_monitor:
+        power_stats = power_monitor.stop_sampling()
+
+    # Calculate latency
+    latency_ms = start_event.elapsed_time(end_event) / actual_num_runs / repeat_n
+
+    # Return results
+    yield {
+        "latency_ms": latency_ms,
+        "power_stats": power_stats,
+        "throttled": throttled,
+        "num_runs_executed": actual_num_runs,
+        "used_cuda_graph": use_graph,  # NEW: Inform caller which path was used
+    }
+
+
+@contextmanager
+def power_monitoring_only(device, measure_power: bool | None = None):
+    """
+    Lightweight context manager for TRT profiler cases.
+    Only handles power monitoring, no timing/warmup.
+
+    Args:
+        device: torch.device object
+        measure_power: Enable power monitoring (None = auto-detect from env)
+
+    Yields:
+        PowerMonitor instance or None
+    """
+    # Auto-detect from environment if not specified
+    if measure_power is None:
+        measure_power = _parse_bool_env("COLLECTOR_MEASURE_POWER", default=False)
+
+    power_monitor = None
+
+    if measure_power:
+        power_monitor = PowerMonitor(device.index)
+        if not power_monitor.start_sampling():
+            power_monitor = None  # Failed to start
+            logging.getLogger(__name__).warning("Failed to start power monitoring")
+
+    try:
+        yield power_monitor
+    finally:
+        # Cleanup happens after yield returns
+        pass
 
 
 def setup_signal_handlers(worker_id, error_queue=None):
@@ -79,7 +439,7 @@ def setup_logging(scope=["all"], debug=False, worker_id=None):
     # For worker processes
     if worker_id is not None:
         # Read configuration from environment
-        debug = os.environ.get("COLLECTOR_DEBUG", "false").lower() == "true"
+        debug = _parse_bool_env("COLLECTOR_DEBUG", default=False)
         log_dir = os.environ.get("COLLECTOR_LOG_DIR", "")
 
         if log_dir:
@@ -219,21 +579,42 @@ def save_error_report(errors, filename):
 
 
 def get_sm_version():
-    # Init
-    (err,) = cuda.cuInit(0)
+    """Get CUDA compute capability (SM version)"""
+    try:
+        import torch
 
-    # Device
-    err, cu_device = cuda.cuDeviceGet(0)
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            capability = torch.cuda.get_device_capability(device)
+            return capability[0] * 10 + capability[1]
+    except Exception:
+        pass
 
-    # Get target architecture
-    err, sm_major = cuda.cuDeviceGetAttribute(
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cu_device
-    )
-    err, sm_minor = cuda.cuDeviceGetAttribute(
-        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cu_device
-    )
+    # fallback to cuda-python
+    try:
+        from cuda import cuda
 
-    return sm_major * 10 + sm_minor
+        # Init
+        (err,) = cuda.cuInit(0)
+        if err != 0:
+            raise RuntimeError(f"cuInit failed with error code: {err}")
+
+        # Device
+        err, cu_device = cuda.cuDeviceGet(0)
+        if err != 0:
+            raise RuntimeError(f"cuDeviceGet failed with error code: {err}")
+
+        # Get target architecture
+        err, sm_major = cuda.cuDeviceGetAttribute(
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cu_device
+        )
+        err, sm_minor = cuda.cuDeviceGetAttribute(
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cu_device
+        )
+
+        return sm_major * 10 + sm_minor
+    except Exception as e:
+        raise RuntimeError(f"Cannot get SM version: both PyTorch and cuda-python failed. Error: {e}") from e
 
 
 def create_test_case_id(test_case, test_type, module_name):
@@ -251,6 +632,7 @@ def log_perf(
     op_name: str,
     kernel_source: str,
     perf_filename: str,
+    power_stats: dict | None = None,  # NEW PARAMETER
 ):
     lock_file = perf_filename + ".lock"
 
@@ -308,3 +690,229 @@ def log_perf(
         # Always delete the lock file, even if writing crashed
         if got_lock and os.path.exists(lock_file):
             os.unlink(lock_file)
+
+
+# Helper functions for MoE
+def balanced_logits(num_tokens, num_experts, topk):
+    import torch
+    import torch.nn.functional as F
+
+    # h_selected_experts = -torch.ones([num_tokens, topk]).to(torch.device(device))
+    h_selected_experts = -torch.ones([num_tokens, topk])
+    stride = math.ceil(num_experts / topk)
+
+    for token_i in range(num_tokens):
+        for i in range(topk):
+            if num_tokens >= stride:
+                h_selected_experts[token_i][i] = (token_i + i * stride) % num_experts
+            else:
+                h_selected_experts[token_i][i] = (token_i * stride / num_tokens + i * stride) % num_experts
+
+    expert_map = F.one_hot(h_selected_experts.long(), num_classes=num_experts).sum(1)
+    router_logits = F.softmax(expert_map.bfloat16(), dim=1)
+    return router_logits
+
+
+def sample_power_law(size, alpha, xmin, xmax):
+    """Sample from a power law distribution using inverse CDF method.
+
+    Args:
+        size: Number of samples
+        alpha: Power law exponent
+        xmin: Minimum value
+        xmax: Maximum value
+
+    Returns:
+        torch.Tensor of sampled values
+    """
+    import torch
+
+    u = torch.rand(size)
+    inv_cdf = ((xmax ** (1 - alpha) - xmin ** (1 - alpha)) * u + xmin ** (1 - alpha)) ** (1 / (1 - alpha))
+    return inv_cdf
+
+
+def _generate_power_law_distribution(num_tokens, num_experts, topk, ep, alpha):
+    """Core function to generate power law token distribution across experts.
+
+    This is the shared logic used by power_law_logits_v3, power_law_deepep_prefill, and power_law_deepep_decode.
+
+    Args:
+        num_tokens: Number of tokens
+        num_experts: Total number of experts
+        topk: Number of experts per token
+        ep: Expert parallelism size
+        alpha: Power law exponent
+
+    Returns:
+        Tuple of (num_tokens_per_expert, h_selected_experts):
+            - num_tokens_per_expert: Token count per expert (with EP rank 0 having max load)
+            - h_selected_experts: Expert assignments matrix [num_tokens, topk]
+    """
+    import torch
+
+    # Sample initial distribution
+    if num_tokens * topk > num_experts:
+        num_tokens_per_expert = sample_power_law(num_experts, alpha, 1, num_tokens * 0.8)
+    else:
+        num_tokens_per_expert = sample_power_law(num_experts, alpha, 0.01, 2)
+
+    target_sum = num_tokens * topk
+    original_distribution = num_tokens_per_expert / num_tokens_per_expert.sum()
+    target_distribution = original_distribution * target_sum
+    num_tokens_per_expert = torch.round(target_distribution).to(torch.int64)
+
+    # Adjust to match exact target sum
+    current_sum = num_tokens_per_expert.sum().item()
+    delta = target_sum - current_sum
+    if delta != 0:
+        sorted_indices = torch.argsort(num_tokens_per_expert, descending=True)
+        if delta > 0:
+            for i in range(delta):
+                expert_idx = sorted_indices[i % len(sorted_indices)]
+                num_tokens_per_expert[expert_idx] += 1
+        else:
+            for i in range(-delta):
+                expert_idx = sorted_indices[-(i % len(sorted_indices)) - 1]
+                if num_tokens_per_expert[expert_idx] > 0:
+                    num_tokens_per_expert[expert_idx] -= 1
+                else:
+                    num_tokens_per_expert[torch.argmax(num_tokens_per_expert)] -= 1
+
+    # Validate distribution
+    if len(num_tokens_per_expert) > 1:
+        sorted_tokens = torch.sort(num_tokens_per_expert, descending=True)[0]
+        assert sorted_tokens[0] >= sorted_tokens[-1], "Power law distribution pattern disrupted"
+
+    # Find EP rank with max load and swap to rank 0
+    with torch.no_grad():
+        conv1d = torch.nn.Conv1d(
+            in_channels=1,
+            out_channels=1,
+            kernel_size=num_experts // ep,
+            stride=num_experts // ep,
+            padding=0,
+            bias=False,
+        )
+        conv1d_weights = torch.tensor([1 for _ in range(num_experts // ep)])
+        conv1d.weight.copy_(conv1d_weights)
+
+    res = conv1d(num_tokens_per_expert.unsqueeze(0).unsqueeze(0).float())
+    max_ep_idx = torch.argmax(res).item()
+
+    if max_ep_idx != 0:
+        ep_group_size = num_experts // ep
+        num_tokens_per_expert_reshaped = num_tokens_per_expert.view(ep, ep_group_size)
+        num_tokens_per_expert_reshaped[0], num_tokens_per_expert_reshaped[max_ep_idx] = (
+            num_tokens_per_expert_reshaped[max_ep_idx].clone(),
+            num_tokens_per_expert_reshaped[0].clone(),
+        )
+        num_tokens_per_expert = num_tokens_per_expert_reshaped.view(-1)
+
+    # Debug output
+    aic_debug = int(os.getenv("AIC_DEBUG", "0"))
+    if aic_debug >= 1:
+        print("num_tokens_per_expert", num_tokens_per_expert, num_tokens_per_expert.sum().item())
+
+    # Generate expert assignments
+    _, num_tokens_per_expert_sorted_index = torch.sort(num_tokens_per_expert, descending=True)
+    expert_assignments = []
+    for expert_id in num_tokens_per_expert_sorted_index.tolist():
+        expert_assignments.extend([expert_id] * num_tokens_per_expert[expert_id])
+
+    expert_assignments = torch.tensor(expert_assignments, dtype=torch.int64)
+    h_selected_experts = expert_assignments.reshape(topk, num_tokens).T
+
+    return num_tokens_per_expert, h_selected_experts
+
+
+def power_law_logits_v3(num_tokens, num_experts, topk, ep, alpha):
+    """Generate power law distributed router logits for MoE.
+
+    Used by: sglang/collect_moe.py, vllm/collect_moe.py, trtllm/collect_moe.py
+
+    Args:
+        num_tokens: Number of tokens
+        num_experts: Total number of experts
+        topk: Number of experts per token
+        ep: Expert parallelism size
+        alpha: Power law exponent
+
+    Returns:
+        router_logits: [num_tokens, num_experts] tensor of softmax probabilities
+    """
+    import torch.nn.functional as F
+
+    num_tokens_per_expert, h_selected_experts = _generate_power_law_distribution(
+        num_tokens, num_experts, topk, ep, alpha
+    )
+
+    # Convert to router logits via one-hot encoding and softmax
+    expert_map = F.one_hot(h_selected_experts.long(), num_classes=num_experts).sum(1)
+    router_logits = F.softmax(expert_map.bfloat16(), dim=1)
+    return router_logits
+
+
+def power_law_deepep_prefill(num_tokens, num_experts, topk, ep, alpha):
+    """Generate power law distribution for DeepEP MoE prefill phase.
+
+    Used by: sglang/collect_wideep_deepep_moe.py
+
+    Args:
+        num_tokens: Number of tokens
+        num_experts: Total number of experts
+        topk: Number of experts per token
+        ep: Expert parallelism size
+        alpha: Power law exponent
+
+    Returns:
+        Tuple of (topk_idx, topk_weights, num_recv_tokens_per_expert):
+            - topk_idx: [num_tokens, topk] expert indices (-1 for masked)
+            - topk_weights: [num_tokens, topk] expert weights (0.0 for masked)
+            - num_recv_tokens_per_expert: Padded token count per local expert
+    """
+    import torch
+
+    num_tokens_per_expert, h_selected_experts = _generate_power_law_distribution(
+        num_tokens, num_experts, topk, ep, alpha
+    )
+
+    # Convert to DeepEP format: topk_idx, topk_weights, num_recv
+    num_local_experts = num_experts // ep
+    topk_idx = h_selected_experts.clone().contiguous()
+    topk_weights = torch.full_like(topk_idx, 0.1, dtype=torch.float32)
+
+    # Mask experts not in rank 0
+    mask = topk_idx >= num_local_experts
+    topk_idx[mask] = -1
+    topk_weights[mask] = 0.0
+
+    # num_recv for rank 0 experts (padded to 128)
+    num_recv_tokens_per_expert = num_tokens_per_expert[:num_local_experts]
+    num_recv_tokens_per_expert = (num_recv_tokens_per_expert + 127) // 128 * 128
+
+    return topk_idx, topk_weights, num_recv_tokens_per_expert
+
+
+def power_law_deepep_decode(num_tokens, num_experts, topk, ep, alpha):
+    """Generate power law distribution for DeepEP MoE decode phase.
+
+    Creates a power law token distribution across all experts, then returns
+    the distribution for the EP rank that has the highest total token count.
+
+    Used by: sglang/collect_wideep_deepep_moe.py
+
+    Args:
+        num_tokens: Number of tokens
+        num_experts: Total number of experts
+        topk: Number of experts per token
+        ep: Expert parallelism size
+        alpha: Power law exponent
+
+    Returns:
+        Token count for each local expert on the max-load EP rank (rank 0 after swap)
+    """
+    # Reuse core distribution generation (max-load rank is swapped to rank 0)
+    num_tokens_per_expert, _ = _generate_power_law_distribution(num_tokens, num_experts, topk, ep, alpha)
+    experts_per_rank = num_experts // ep
+    return num_tokens_per_expert.view(ep, experts_per_rank)[0]

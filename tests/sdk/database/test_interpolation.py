@@ -144,11 +144,21 @@ class TestInterpolationMethods:
 
         # Test bilinear method
         result_bilinear = comprehensive_perf_db._interp_2d_1d(15, 35, 55, data, method="bilinear")
-        assert result_bilinear > 0
+        # Result can be dict (new format) or float (legacy)
+        if isinstance(result_bilinear, dict):
+            assert result_bilinear["latency"] > 0
+            assert result_bilinear["power"] >= 0
+        else:
+            assert result_bilinear > 0
 
         # Test cubic method (if scipy is available)
         result_cubic = comprehensive_perf_db._interp_2d_1d(15, 35, 55, data, method="cubic")
-        assert result_cubic > 0
+        # Result can be dict (new format) or float (legacy)
+        if isinstance(result_cubic, dict):
+            assert result_cubic["latency"] > 0
+            assert result_cubic["power"] >= 0
+        else:
+            assert result_cubic > 0
 
         # Invalid method should raise error
         with pytest.raises(NotImplementedError):
@@ -164,11 +174,21 @@ class TestInterpolationMethods:
 
         # Test linear method
         result_linear = comprehensive_perf_db._interp_3d(15, 35, 55, data, "linear")
-        assert result_linear > 0
+        # Result can be dict (new format) or float (legacy)
+        if isinstance(result_linear, dict):
+            assert result_linear["latency"] > 0
+            assert result_linear["power"] >= 0
+        else:
+            assert result_linear > 0
 
         # Test fallback to 2D-1D
         result_bilinear = comprehensive_perf_db._interp_3d(15, 35, 55, data, "bilinear")
-        assert result_bilinear > 0
+        # Result can be dict (new format) or float (legacy)
+        if isinstance(result_bilinear, dict):
+            assert result_bilinear["latency"] > 0
+            assert result_bilinear["power"] >= 0
+        else:
+            assert result_bilinear > 0
 
 
 class TestExtrapolateDataGrid:
@@ -283,7 +303,7 @@ class TestCorrectData:
         m, n, k = 64, 128, 256
 
         # Calculate what SOL should be
-        sol_value = comprehensive_perf_db.query_gemm(m, n, k, quant_mode, sol_mode=common.SOLMode.SOL)
+        sol_value = comprehensive_perf_db.query_gemm(m, n, k, quant_mode, database_mode=common.DatabaseMode.SOL)
 
         # Set an artificially low value
         comprehensive_perf_db._gemm_data[quant_mode][m][n][k] = sol_value * 0.5
@@ -304,7 +324,7 @@ class TestCorrectData:
 
         # Calculate SOL
         sol_value = comprehensive_perf_db.query_generation_attention(
-            b, s, n, n, kv_cache_quant_mode, sol_mode=common.SOLMode.SOL
+            b, s, n, n, kv_cache_quant_mode, database_mode=common.DatabaseMode.SOL
         )
 
         # Set an artificially low value

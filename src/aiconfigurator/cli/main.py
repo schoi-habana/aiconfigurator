@@ -6,6 +6,7 @@ import copy
 import json
 import logging
 import os
+import sys
 import time
 from typing import Any
 
@@ -14,10 +15,12 @@ import yaml
 
 from aiconfigurator import __version__
 from aiconfigurator.cli.report_and_save import log_final_summary, save_results
-from aiconfigurator.generator.cli_args import add_config_generation_cli
+from aiconfigurator.generator.api import add_generator_override_arguments, generator_cli_helper
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.pareto_analysis import (
+    get_best_configs_under_request_latency_constraint,
     get_best_configs_under_tpot_constraint,
+    get_pareto_front,
 )
 from aiconfigurator.sdk.task import TaskConfig, TaskRunner
 from aiconfigurator.sdk.utils import get_model_config_from_hf_id
@@ -29,7 +32,7 @@ def _build_common_cli_parser() -> argparse.ArgumentParser:
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument("--save_dir", type=str, default=None, help="Directory to save the results.")
     common_parser.add_argument("--debug", action="store_true", help="Enable debug mode.")
-    add_config_generation_cli(common_parser, default_backend=common.BackendName.trtllm.value)
+    add_generator_override_arguments(common_parser)
     return common_parser
 
 
@@ -79,10 +82,25 @@ def _add_default_mode_arguments(parser):
         default=None,
         help="Backend database version. Default is latest",
     )
+    parser.add_argument(
+        "--database_mode",
+        choices=[mode.name for mode in common.DatabaseMode if mode != common.DatabaseMode.SOL_FULL],
+        type=str,
+        default=common.DatabaseMode.SILICON.name,
+        help="Database mode for performance estimation. Options: SILICON (default, uses silicon data), "
+        "HYBRID (uses silicon data when available, otherwise SOL+empirical factor), "
+        "EMPIRICAL (SOL+empirical factor), SOL (provide SOL time only).",
+    )
     parser.add_argument("--isl", type=int, default=4000, help="Input sequence length.")
     parser.add_argument("--osl", type=int, default=1000, help="Output sequence length.")
     parser.add_argument("--ttft", type=float, default=2000.0, help="Time to first token in ms.")
     parser.add_argument("--tpot", type=float, default=30.0, help="Time per output token in ms.")
+    parser.add_argument(
+        "--request_latency",
+        type=float,
+        default=None,
+        help="Optional end-to-end request latency target (ms). Enables request-latency optimization mode.",
+    )
     parser.add_argument("--prefix", type=int, default=0, help="Prefix cache length. Default to 0.")
 
 
@@ -133,7 +151,9 @@ def _build_default_task_configs(args) -> dict[str, TaskConfig]:
         "osl": args.osl,
         "ttft": args.ttft,
         "tpot": args.tpot,
+        "request_latency": args.request_latency,
         "prefix": args.prefix,
+        "database_mode": args.database_mode,
     }
 
     task_configs: dict[str, TaskConfig] = {}
@@ -161,9 +181,11 @@ _EXPERIMENT_RESERVED_KEYS = {
     "osl",
     "ttft",
     "tpot",
+    "request_latency",
     "enable_wideep",
     "total_gpus",
     "use_specific_quant_mode",
+    "database_mode",
 }
 
 
@@ -266,7 +288,7 @@ def _build_experiment_task_configs(args) -> dict[str, TaskConfig]:
             task_kwargs["decode_system_name"] = inferred_decode_system or system_name
 
         # Per-experiment overrides for runtime numeric parameters if provided at top level
-        for numeric_key in ("isl", "osl", "ttft", "tpot"):
+        for numeric_key in ("isl", "osl", "ttft", "tpot", "request_latency"):
             if numeric_key in exp_config:
                 task_kwargs[numeric_key] = exp_config[numeric_key]
 
@@ -274,6 +296,8 @@ def _build_experiment_task_configs(args) -> dict[str, TaskConfig]:
             task_kwargs["enable_wideep"] = exp_config["enable_wideep"]
         if "use_specific_quant_mode" in exp_config:
             task_kwargs["use_specific_quant_mode"] = exp_config["use_specific_quant_mode"]
+        if "database_mode" in exp_config:
+            task_kwargs["database_mode"] = exp_config["database_mode"]
 
         yaml_config = _build_yaml_config(exp_config, config_section)
         if yaml_config:
@@ -308,10 +332,9 @@ def _execute_task_configs(
             logger.info("Task config: %s", task_config.pretty())
             task_result = runner.run(task_config)
             pareto_df = task_result["pareto_df"]
-            pareto_frontier_df = task_result["pareto_frontier_df"]
-            if pareto_frontier_df is not None and not pareto_frontier_df.empty:
+            if pareto_df is not None and not pareto_df.empty:
                 results[exp_name] = task_result
-                logger.info("Experiment %s completed with %d results.", exp_name, len(pareto_frontier_df))
+                logger.info("Experiment %s completed with %d results.", exp_name, len(pareto_df))
             else:
                 logger.warning(
                     "Experiment %s returned no results. The TTFT and TPOT constraints may need to be relaxed.", exp_name
@@ -326,21 +349,55 @@ def _execute_task_configs(
     best_configs: dict[str, pd.DataFrame] = {}
     best_throughputs: dict[str, float] = {}
     pareto_fronts: dict[str, pd.DataFrame | None] = {}
+    pareto_x_axis: dict[str, str] = {}
     for name, task_result in results.items():
         pareto_df = task_result["pareto_df"]
-        pareto_frontier_df = task_result["pareto_frontier_df"]
-        target_tpot = task_configs[name].config.runtime_config.tpot
+        runtime_cfg = task_configs[name].config.runtime_config
+        target_tpot = runtime_cfg.tpot
+        target_request_latency = runtime_cfg.request_latency
+        use_request_latency = target_request_latency is not None and target_request_latency > 0
         total_gpus = getattr(task_configs[name], "total_gpus", None) or 0
+
+        # Compute tokens/s/gpu_cluster for pareto_df
+        if pareto_df is not None and not pareto_df.empty:
+            pareto_df["tokens/s/gpu_cluster"] = (
+                pareto_df["tokens/s/gpu"]
+                * (total_gpus // pareto_df["num_total_gpus"])
+                * pareto_df["num_total_gpus"]
+                / total_gpus
+            )
+            x_axis_col = "request_latency" if use_request_latency else "tokens/s/user"
+            pareto_frontier_df = get_pareto_front(
+                pareto_df,
+                x_axis_col,
+                "tokens/s/gpu_cluster",
+                maximize_x=not use_request_latency,
+                maximize_y=True,
+            )
+        else:
+            pareto_frontier_df = pd.DataFrame()
+            x_axis_col = "request_latency" if use_request_latency else "tokens/s/user"
+
         group_by_key = "(d)parallel" if task_configs[name].serving_mode == "disagg" else "parallel"
-        best_config_df = get_best_configs_under_tpot_constraint(  # based on all data points
-            total_gpus=total_gpus,
-            pareto_df=pareto_df,
-            target_tpot=target_tpot,
-            top_n=5,
-            group_by=group_by_key,
-        )
+        if use_request_latency:
+            best_config_df = get_best_configs_under_request_latency_constraint(
+                total_gpus=total_gpus,
+                pareto_df=pareto_df,
+                target_request_latency=target_request_latency,
+                top_n=5,
+                group_by=group_by_key,
+            )
+        else:
+            best_config_df = get_best_configs_under_tpot_constraint(  # based on all data points
+                total_gpus=total_gpus,
+                pareto_df=pareto_df,
+                target_tpot=target_tpot,
+                top_n=5,
+                group_by=group_by_key,
+            )
         best_configs[name] = best_config_df
         pareto_fronts[name] = pareto_frontier_df
+        pareto_x_axis[name] = x_axis_col
         if not best_config_df.empty:
             best_throughputs[name] = best_config_df["tokens/s/gpu_cluster"].values[0]
         else:
@@ -355,6 +412,7 @@ def _execute_task_configs(
         pareto_fronts=pareto_fronts,  # for plotting
         task_configs=task_configs,  # for info in summary
         mode=mode,
+        pareto_x_axis=pareto_x_axis,
     )
 
     end_time = time.time()
@@ -395,6 +453,8 @@ def main(args):
 
 
 if __name__ == "__main__":
+    if generator_cli_helper(sys.argv[1:]):
+        sys.exit(0)
     parser = argparse.ArgumentParser(description="Dynamo AIConfigurator for Disaggregated Serving Deployment")
     configure_parser(parser)
     args = parser.parse_args()

@@ -41,7 +41,7 @@ from datetime import datetime
 import torch
 from tqdm import tqdm
 
-from helper import create_test_case_id, save_error_report, setup_logging, setup_signal_handlers
+from helper import EXIT_CODE_RESTART, create_test_case_id, save_error_report, setup_logging, setup_signal_handlers
 
 logger = None
 
@@ -101,14 +101,12 @@ def worker(queue, device_id: int, func, progress_value, lock, error_queue=None, 
             task = task_info
             task_id = create_test_case_id(task, "unknown", module_name)
 
-        with lock:
-            progress_value.value += 1
-
         try:
             worker_logger.debug(f"Starting task {task_id}")
             func(*task, device, device_id)
             worker_logger.debug(f"Completed task {task_id}")
         except Exception as e:
+            # Build comprehensive error info
             error_info = {
                 "module": module_name,
                 "device_id": device_id,
@@ -120,14 +118,42 @@ def worker(queue, device_id: int, func, progress_value, lock, error_queue=None, 
                 "timestamp": datetime.now().isoformat(),
             }
 
+            # Report error to queue BEFORE any exit
             if error_queue:
                 error_queue.put(error_info)
 
             worker_logger.exception(f"Task {task_id} failed")
 
-            # Force flush logs
+            # Force flush logs before any potential exit
             for handler in worker_logger.handlers:
                 handler.flush()
+
+            # This error is could be fatal and require a process restart.
+            if isinstance(e, torch.AcceleratorError):
+                worker_logger.warning(
+                    f"Fatal AcceleratorError encountered on task {task_id}. "
+                    f"Worker {device_id} exiting to reset GPU context. "
+                    f"Progress: {progress_value.value}"
+                )
+                # Flush logs again after warning
+                for handler in worker_logger.handlers:
+                    handler.flush()
+                # Exiting with non-zero code will add an additional error to the summary,
+                # which we don't want (error already reported above).
+                exit(0)
+        finally:
+            # CRITICAL: Increment progress regardless of success or failure
+            # This marks the task as "attempted" and tracks overall progress
+            with lock:
+                progress_value.value += 1
+
+            # Periodic memory cleanup to reduce fragmentation
+            # Only do this every 100 tasks to avoid overhead
+            if progress_value.value % 100 == 0:
+                import gc
+
+                gc.collect()
+                torch.cuda.empty_cache()
 
 
 def parallel_run(tasks, func, num_processes, module_name="unknown"):
@@ -152,7 +178,7 @@ def parallel_run(tasks, func, num_processes, module_name="unknown"):
         return p
 
     def create_process_exit_error(device_id, exit_code):
-        if exit_code in (None, 0):
+        if exit_code in (None, 0, EXIT_CODE_RESTART):
             return None
 
         if exit_code < 0:
@@ -223,10 +249,8 @@ def parallel_run(tasks, func, num_processes, module_name="unknown"):
             # Stall detection unchanged...
             if progress_value.value == last_progress:
                 stall_count += 1
-                if stall_count > 30 and "moe" not in func.__name__:
+                if stall_count > 30:
                     logger.warning(f"Progress stalled at {progress_value.value}/{len(tasks)}")
-                if stall_count > 900 and "moe" in func.__name__:
-                    logger.warning(f"Moe Progress stalled at {progress_value.value}/{len(tasks)}")
             else:
                 stall_count = 0
                 last_progress = progress_value.value
@@ -236,11 +260,17 @@ def parallel_run(tasks, func, num_processes, module_name="unknown"):
                 if not p.is_alive():
                     exit_code = p.exitcode
                     process_stats[i]["restarts"] += 1
-                    logger.warning(
-                        f"Process {i} died (exit code: {exit_code}, "
-                        f"restarts: {process_stats[i]['restarts']}, "
-                        f"errors: {len(process_stats[i]['errors'])})"
-                    )
+                    if exit_code == EXIT_CODE_RESTART:
+                        logger.debug(
+                            f"Process {i} completed task and exited normally for release gpu memory"
+                            f"(completed tasks: {process_stats[i]['restarts']})"
+                        )
+                    else:
+                        logger.warning(
+                            f"Process {i} died (exit code: {exit_code}, "
+                            f"restarts: {process_stats[i]['restarts']}, "
+                            f"errors: {len(process_stats[i]['errors'])})"
+                        )
 
                     crash_error = create_process_exit_error(i, exit_code)
                     if crash_error:
@@ -267,13 +297,13 @@ def parallel_run(tasks, func, num_processes, module_name="unknown"):
 
     # Wait for processes
     for p in processes:
-        if "moe" in func.__name__:
-            p.join(timeout=500)  # tune + 30 tokens cases
-        else:
-            p.join(timeout=10)
+        p.join(timeout=10)
         if p.is_alive():
             logger.warning(f"Process {p.pid} did not terminate, forcing...")
             p.terminate()
+
+    # Shutdown manager to clean up resources (semaphores, etc.)
+    manager.shutdown()
 
     # Log summary
     if errors:
@@ -358,6 +388,7 @@ def collect_sglang(num_processes: int, ops: list[str] | None = None):
         return
 
     # Define collection modules - each test type as separate entry
+    # Non-wideep collections (support multi-process parallel)
     collections = [
         # GEMM collection
         {
@@ -421,14 +452,61 @@ def collect_sglang(num_processes: int, ops: list[str] | None = None):
             "run_func": "run_attention_torch",
         },
     ]
+
+    # Wideep collections - require single process due to NCCL/distributed init conflicts
+    wideep_collections = [
+        {
+            "name": "sglang",
+            "type": "wideep_mla_context",
+            "module": "collector.sglang.collect_wideep_attn",
+            "get_func": "get_wideep_mla_context_test_cases",
+            "run_func": "run_wideep_mla_context",
+        },
+        {
+            "name": "sglang",
+            "type": "wideep_mla_generation",
+            "module": "collector.sglang.collect_wideep_attn",
+            "get_func": "get_wideep_mla_generation_test_cases",
+            "run_func": "run_wideep_mla_generation",
+        },
+        {
+            "name": "sglang",
+            "type": "wideep_mlp_context",
+            "module": "collector.sglang.collect_wideep_mlp",
+            "get_func": "get_wideep_mlp_context_test_cases",
+            "run_func": "run_wideep_mlp_context",
+        },
+        {
+            "name": "sglang",
+            "type": "wideep_mlp_generation",
+            "module": "collector.sglang.collect_wideep_mlp",
+            "get_func": "get_wideep_mlp_generation_test_cases",
+            "run_func": "run_wideep_mlp_generation",
+        },
+        {
+            "name": "sglang",
+            "type": "wideep_moe",
+            "module": "collector.sglang.collect_wideep_deepep_moe",
+            "get_func": "get_wideep_moe_test_cases",
+            "run_func": "run_wideep_moe",
+        },
+    ]
+
+    # Run non-wideep collections with multi-process
     all_errors = collect_ops(num_processes, collections, ops, version)
+
+    # Run wideep collections - now supports multi-process with proper port isolation
+    if ops is None or any(c["type"] in ops for c in wideep_collections):
+        logger.info(f"Running wideep collections with {num_processes} processes")
+        wideep_errors = collect_ops(num_processes, wideep_collections, ops, version)
+        all_errors.extend(wideep_errors)
 
     generate_collection_summary(all_errors, "sglang", version)
 
 
 def collect_vllm(num_processes: int, ops: list[str] | None = None):
     """
-    Collect performance data for VLLM v1.
+    Collect performance data for VLLM
     """
 
     try:
@@ -442,7 +520,7 @@ def collect_vllm(num_processes: int, ops: list[str] | None = None):
 
     collections = [
         # GEMM collections
-        # vllm v1 GEMM collection for fp16, fp8, fp8_block, nvfp4, awq, and gptq
+        # vllm GEMM collection for fp16, fp8, fp8_block, nvfp4, awq, and gptq
         {
             "name": "vllm",
             "type": "gemm",
@@ -463,6 +541,27 @@ def collect_vllm(num_processes: int, ops: list[str] | None = None):
             "type": "attention_generation",
             "module": "collector.vllm.collect_attn",
             "get_func": "get_generation_attention_test_cases",
+            "run_func": "run_attention_torch",
+        },
+        {
+            "name": "vllm",
+            "type": "moe",
+            "module": "collector.vllm.collect_moe",
+            "get_func": "get_moe_test_cases",
+            "run_func": "run_moe_torch",
+        },
+        {
+            "name": "vllm",
+            "type": "mla_context",
+            "module": "collector.vllm.collect_mla",
+            "get_func": "get_context_mla_test_cases",
+            "run_func": "run_attention_torch",
+        },
+        {
+            "name": "vllm",
+            "type": "mla_generation",
+            "module": "collector.vllm.collect_mla",
+            "get_func": "get_generation_mla_test_cases",
             "run_func": "run_attention_torch",
         },
     ]
@@ -783,10 +882,26 @@ def main():
             "mla_bmm_gen_pre",
             "mla_bmm_gen_post",
             "moe",
+            "wideep_mla_context",
+            "wideep_mla_generation",
+            "wideep_mlp_context",
+            "wideep_mlp_generation",
+            "wideep_moe",
         ],
         help="Run only specified collection items. Leave empty to run all. "
         "Available ops vary by backend - see backend-specific collectors for details.",
         default=None,
+    )
+    parser.add_argument(
+        "--measure_power",
+        action="store_true",
+        help="Enable power monitoring during kernel execution (samples at 100ms intervals)",
+    )
+    parser.add_argument(
+        "--power_test_duration_sec",
+        type=float,
+        default=1.0,
+        help="Minimum duration for kernel runs when power measurement is enabled (default: 1.0s)",
     )
     args = parser.parse_args()
     ops = args.ops
@@ -805,6 +920,14 @@ def main():
         num_processes = htexp.hpu.device_count()
 
     logger.info(f"Starting collection with {num_processes} GPU processes")
+
+    # Set environment variables for worker processes
+    if args.measure_power:
+        os.environ["COLLECTOR_MEASURE_POWER"] = "true"
+        os.environ["COLLECTOR_POWER_MIN_DURATION"] = str(args.power_test_duration_sec)
+        logger.info(f"Power monitoring enabled (min duration: {args.power_test_duration_sec}s)")
+    else:
+        os.environ["COLLECTOR_MEASURE_POWER"] = "false"
 
     mp.set_start_method("spawn")
 

@@ -21,7 +21,7 @@ def create_model_name_config(app_config):
     return {"model_name": model_name}
 
 
-def create_system_config(app_config):
+def create_system_config(app_config, gpu_config=False):
     """create system config components"""
     database_dict = get_all_databases()
     system_choices = sorted(database_dict.keys())
@@ -31,14 +31,66 @@ def create_system_config(app_config):
     version_choices = sorted(database_dict[default_system][default_backend].keys())
     default_version = version_choices[-1]
 
-    with gr.Accordion("System config"), gr.Row():
-        system = gr.Dropdown(choices=system_choices, label="System", value=default_system, interactive=True)
-        backend = gr.Dropdown(choices=backend_choices, label="Backend", value=default_backend, interactive=True)
-        version = gr.Dropdown(choices=version_choices, label="Version", value=default_version, interactive=True)
+    with gr.Accordion("System config"):
+        with gr.Row():
+            system = gr.Dropdown(
+                choices=system_choices,
+                label="System",
+                value=default_system,
+                interactive=True,
+            )
+            backend = gr.Dropdown(
+                choices=backend_choices,
+                label="Backend",
+                value=default_backend,
+                interactive=True,
+            )
+            version = gr.Dropdown(
+                choices=version_choices,
+                label="Version",
+                value=default_version,
+                interactive=True,
+            )
+            database_mode = gr.Dropdown(
+                choices=[
+                    common.DatabaseMode.SILICON.name,
+                    common.DatabaseMode.HYBRID.name,
+                    common.DatabaseMode.EMPIRICAL.name,
+                    common.DatabaseMode.SOL.name,
+                ],
+                label="Database Mode",
+                value=common.DatabaseMode.SILICON.name,
+                interactive=True,
+            )
+        if gpu_config:
+            with gr.Row():
+                gpu_config_components = {
+                    "min_gpu_per_engine": gr.Number(
+                        label="Minimum GPUs per engine",
+                        value=4,
+                        interactive=True,
+                    ),
+                    "max_gpu_per_engine": gr.Number(
+                        label="Maximum GPUs per engine",
+                        value=16,
+                        interactive=True,
+                    ),
+                    "gpus_per_node": gr.Number(
+                        label="GPUs per node",
+                        value=8,
+                        interactive=True,
+                    ),
+                }
+        else:
+            gpu_config_components = {}
 
-        sol_mode = gr.Checkbox(label="SOL Mode", value=False, interactive=True, visible=app_config["experimental"])
-
-    return {"system": system, "backend": backend, "version": version, "sol_mode": sol_mode}
+    return {
+        "system": system,
+        "backend": backend,
+        "version": version,
+        "database_mode": database_mode,
+        **gpu_config_components,
+    }
 
 
 def create_model_quant_config(app_config):
@@ -63,7 +115,7 @@ def create_model_quant_config(app_config):
                 choices=gemm_quant_mode_choices,
                 label="gemm quant mode",
                 allow_custom_value=False,
-                value="fp8" if "fp8" in gemm_quant_mode_choices else gemm_quant_mode_choices[0],
+                value="fp8_block" if "fp8_block" in gemm_quant_mode_choices else gemm_quant_mode_choices[0],
                 interactive=True,
             )
             kvcache_quant_mode = gr.Dropdown(
@@ -77,7 +129,7 @@ def create_model_quant_config(app_config):
                 choices=fmha_quant_mode_choices,
                 label="fmha quant mode",
                 allow_custom_value=False,
-                value="float16" if "float16" in fmha_quant_mode_choices else fmha_quant_mode_choices[0],
+                value="fp8" if "fp8" in fmha_quant_mode_choices else fmha_quant_mode_choices[0],
                 interactive=True,
             )
             moe_quant_mode = gr.Dropdown(
@@ -176,19 +228,62 @@ def create_model_misc_config(app_config):
     return {"nextn": nextn, "nextn_accept_rates": nextn_accept_rates, "enable_wideep": enable_wideep}
 
 
-def create_runtime_config(app_config, with_sla=False):
+def create_runtime_config(
+    app_config,
+    with_sla=False,
+    prefix_length=True,
+    tip_text=None,
+    ttft_optional=False,
+    itl_optional=False,
+    with_request_latency=False,
+):
     """create runtime config components"""
 
     with gr.Accordion("Runtime config"):
+        if tip_text:
+            with gr.Row():
+                gr.HTML(f"<span style='color: var(--body-text-color-subdued);'>{tip_text}</span>")
         with gr.Row():
-            isl = gr.Number(value=2048, label="input sequence length", interactive=True)
-            osl = gr.Number(value=128, label="output sequence length", interactive=True)
-            prefix = gr.Number(value=0, label="prefix cache length", interactive=True)
+            isl = gr.Number(
+                value=2048,
+                label="input sequence length",
+                interactive=True,
+            )
+            osl = gr.Number(
+                value=128,
+                label="output sequence length",
+                interactive=True,
+            )
+            if prefix_length:
+                prefix = gr.Number(value=0, label="prefix cache length", interactive=True)
+            else:
+                prefix = None
 
             if with_sla:
-                ttft = gr.Number(value=2000, label="first token latency(ms)", interactive=True)
-                tpot = gr.Number(value=50, label="inter token latency(ms)", interactive=True)
-                return {"isl": isl, "osl": osl, "prefix": prefix, "ttft": ttft, "tpot": tpot}
+                ttft = gr.Number(value=2000, label="first token latency/ms", interactive=True, optional=ttft_optional)
+                tpot = gr.Number(value=50, label="inter token latency/ms", interactive=True, optional=itl_optional)
+                batch_size = None
             else:
                 batch_size = gr.Number(value=1, label="batch size", interactive=True)
-                return {"isl": isl, "osl": osl, "prefix": prefix, "batch_size": batch_size}
+                ttft = None
+                tpot = None
+
+            if with_request_latency:
+                request_latency = gr.Number(
+                    value=None,
+                    label="request latency/ms (optional, set e2e latency constraint)",
+                    interactive=True,
+                    optional=True,
+                )
+            else:
+                request_latency = None
+
+        return {
+            "isl": isl,
+            "osl": osl,
+            "prefix": prefix,
+            "ttft": ttft,
+            "tpot": tpot,
+            "batch_size": batch_size,
+            "request_latency": request_latency,
+        }

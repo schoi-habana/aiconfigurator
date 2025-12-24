@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import functools
 import logging
 import warnings
 
@@ -10,6 +11,7 @@ import pandas as pd
 from aiconfigurator.sdk import common, config, models, perf_database
 from aiconfigurator.sdk.backends.base_backend import BaseBackend
 from aiconfigurator.sdk.inference_summary import InferenceSummary
+from aiconfigurator.sdk.utils import enumerate_ttft_tpot_constraints
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -178,6 +180,117 @@ class DisaggInferenceSession:
         self._prefill_latency_correction_scale = prefill_latency_correction_scale
         self._decode_latency_correction_scale = decode_latency_correction_scale
 
+    def _get_disagg_summary_dict(
+        self,
+        prefill_summary_dict: dict,
+        prefill_num_worker: int,
+        decode_summary_dict: dict,
+        decode_num_worker: int,
+    ) -> dict:
+        """
+        Get the disagg summary as a dict based on prefill and decode summary dicts.
+        The summary dict is used for efficient batch operations.
+        """
+        seq_s = min(
+            prefill_summary_dict["seq/s"] * prefill_num_worker * self._RATE_MATCHING_PREFILL_DEGRADATION_FACTOR,
+            decode_summary_dict["seq/s"] * decode_num_worker * self._RATE_MATCHING_DECODE_DEGRADATION_FACTOR,
+        )
+        prefill_gpus = prefill_summary_dict["pp"] * prefill_summary_dict["tp"] * prefill_summary_dict["dp"]
+        decode_gpus = decode_summary_dict["pp"] * decode_summary_dict["tp"] * decode_summary_dict["dp"]
+        seq_s_gpu = seq_s / (prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker)
+
+        tokens_s = seq_s * prefill_summary_dict["osl"]
+        tokens_s_gpu = tokens_s / (prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker)
+        num_total_gpus = prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker
+        osl = prefill_summary_dict["osl"]
+        request_latency = prefill_summary_dict["ttft"] + decode_summary_dict["tpot"] * max(osl - 1, 0)
+
+        # Calculate weighted average power for DISAGG mode
+        # Power is weighted by time spent in each phase
+        # Note: prefill_power and decode_power are already per-GPU averages
+        ttft = prefill_summary_dict["ttft"]
+        tpot = decode_summary_dict["tpot"]
+        decode_time = tpot * max(osl - 1, 0)
+
+        prefill_power = prefill_summary_dict.get("power_w", 0.0)
+        decode_power = decode_summary_dict.get("power_w", 0.0)
+
+        # DEBUG: Log the power values we're getting
+        logger.debug(
+            f"DISAGG Power Calc: prefill_power={prefill_power}W, "
+            f"decode_power={decode_power}W, ttft={ttft}ms, decode_time={decode_time}ms"
+        )
+
+        # Simple time-weighted average (power values are already per-GPU)
+        total_time = ttft + decode_time
+
+        if total_time > 0:
+            disagg_power_avg = (prefill_power * ttft + decode_power * decode_time) / total_time
+        else:
+            disagg_power_avg = 0.0
+
+        logger.debug(
+            f"DISAGG Power Result: {disagg_power_avg}W (time-weighted from {prefill_power}W and {decode_power}W)"
+        )
+
+        return {
+            "model": prefill_summary_dict["model"],
+            "isl": prefill_summary_dict["isl"],
+            "osl": prefill_summary_dict["osl"],
+            "prefix": prefill_summary_dict["prefix"],
+            # This is not exact matching. You can use this concurrency to benchmark the system.
+            "concurrency": decode_summary_dict["concurrency"] * decode_num_worker,
+            "request_rate": seq_s,
+            "(p)bs": prefill_summary_dict["bs"],
+            "(p)global_bs": prefill_summary_dict["global_bs"],
+            "(p)workers": prefill_num_worker,
+            "(d)bs": decode_summary_dict["bs"],
+            "(d)global_bs": decode_summary_dict["global_bs"],
+            "(d)workers": decode_num_worker,
+            "ttft": prefill_summary_dict["ttft"],
+            "tpot": decode_summary_dict["tpot"],
+            "request_latency": request_latency,
+            "seq/s": seq_s,
+            "seq/s/gpu": seq_s_gpu,
+            "tokens/s": tokens_s,
+            "tokens/s/gpu": tokens_s_gpu,
+            "tokens/s/user": decode_summary_dict["tokens/s/user"],
+            "(p)seq/s/worker": prefill_summary_dict["seq/s"],
+            "(d)seq/s/worker": decode_summary_dict["seq/s"],
+            "num_total_gpus": num_total_gpus,
+            "(p)tp": prefill_summary_dict["tp"],
+            "(p)pp": prefill_summary_dict["pp"],
+            "(p)dp": prefill_summary_dict["dp"],
+            "(p)moe_tp": prefill_summary_dict["moe_tp"],
+            "(p)moe_ep": prefill_summary_dict["moe_ep"],
+            "(p)parallel": prefill_summary_dict["parallel"],
+            "(p)gemm": prefill_summary_dict["gemm"],
+            "(p)kvcache": prefill_summary_dict["kvcache"],
+            "(p)fmha": prefill_summary_dict["fmha"],
+            "(p)moe": prefill_summary_dict["moe"],
+            "(p)comm": prefill_summary_dict["comm"],
+            "(p)memory": prefill_summary_dict["memory"],
+            "(p)backend": prefill_summary_dict["backend"],
+            "(p)version": prefill_summary_dict["version"],
+            "(p)system": prefill_summary_dict["system"],
+            "(d)tp": decode_summary_dict["tp"],
+            "(d)pp": decode_summary_dict["pp"],
+            "(d)dp": decode_summary_dict["dp"],
+            "(d)moe_tp": decode_summary_dict["moe_tp"],
+            "(d)moe_ep": decode_summary_dict["moe_ep"],
+            "(d)parallel": decode_summary_dict["parallel"],
+            "(d)gemm": decode_summary_dict["gemm"],
+            "(d)kvcache": decode_summary_dict["kvcache"],
+            "(d)fmha": decode_summary_dict["fmha"],
+            "(d)moe": decode_summary_dict["moe"],
+            "(d)comm": decode_summary_dict["comm"],
+            "(d)memory": decode_summary_dict["memory"],
+            "(d)backend": decode_summary_dict["backend"],
+            "(d)version": decode_summary_dict["version"],
+            "(d)system": decode_summary_dict["system"],
+            "power_w": disagg_power_avg,  # Weighted average power for DISAGG mode
+        }
+
     def _get_disagg_summary_df(
         self,
         prefill_summary_df: pd.DataFrame,
@@ -188,126 +301,11 @@ class DisaggInferenceSession:
         """
         Get the disagg summary df based on prefill and decode summary df
         """
-        seq_s = min(
-            prefill_summary_df["seq/s"] * prefill_num_worker * self._RATE_MATCHING_PREFILL_DEGRADATION_FACTOR,
-            decode_summary_df["seq/s"] * decode_num_worker * self._RATE_MATCHING_DECODE_DEGRADATION_FACTOR,
-        )
-        prefill_gpus = prefill_summary_df["pp"] * prefill_summary_df["tp"] * prefill_summary_df["dp"]
-        decode_gpus = decode_summary_df["pp"] * decode_summary_df["tp"] * decode_summary_df["dp"]
-        seq_s_gpu = seq_s / (prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker)
+        prefill_dict = prefill_summary_df.iloc[0].to_dict()
+        decode_dict = decode_summary_df.iloc[0].to_dict()
 
-        model_name = prefill_summary_df["model"]
-        isl = prefill_summary_df["isl"]
-        osl = prefill_summary_df["osl"]
-        prefix = prefill_summary_df["prefix"]
-        concurrency = (
-            decode_summary_df["concurrency"] * decode_num_worker
-        )  # this is not exact matching. You can use this concurrency to benchmark the system.
-        request_rate = seq_s
-        p_bs = prefill_summary_df["bs"]
-        p_global_bs = prefill_summary_df["global_bs"]
-        p_workers = prefill_num_worker
-        d_bs = decode_summary_df["bs"]
-        d_global_bs = decode_summary_df["global_bs"]
-        d_workers = decode_num_worker
-        ttft = prefill_summary_df["ttft"]
-        tpot = decode_summary_df["tpot"]
-        tokens_s = seq_s * osl
-        tokens_s_gpu = tokens_s / (prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker)
-        tokens_s_user = decode_summary_df["tokens/s/user"]
-        p_seq_s_worker = prefill_summary_df["seq/s"]
-        d_seq_s_worker = decode_summary_df["seq/s"]
-        num_total_gpus = prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker
-        p_tp = prefill_summary_df["tp"]
-        p_pp = prefill_summary_df["pp"]
-        p_dp = prefill_summary_df["dp"]
-        p_moe_tp = prefill_summary_df["moe_tp"]
-        p_moe_ep = prefill_summary_df["moe_ep"]
-        p_parallel = prefill_summary_df["parallel"]
-        p_gemm = prefill_summary_df["gemm"]
-        p_kvcache = prefill_summary_df["kvcache"]
-        p_fmha = prefill_summary_df["fmha"]
-        p_moe = prefill_summary_df["moe"]
-        p_comm = prefill_summary_df["comm"]
-        p_memory = prefill_summary_df["memory"]
-        p_backend = prefill_summary_df["backend"]
-        p_version = prefill_summary_df["version"]
-        p_system = prefill_summary_df["system"]
-        d_tp = decode_summary_df["tp"]
-        d_pp = decode_summary_df["pp"]
-        d_dp = decode_summary_df["dp"]
-        d_moe_tp = decode_summary_df["moe_tp"]
-        d_moe_ep = decode_summary_df["moe_ep"]
-        d_parallel = decode_summary_df["parallel"]
-        d_gemm = decode_summary_df["gemm"]
-        d_kvcache = decode_summary_df["kvcache"]
-        d_fmha = decode_summary_df["fmha"]
-        d_moe = decode_summary_df["moe"]
-        d_comm = decode_summary_df["comm"]
-        d_memory = decode_summary_df["memory"]
-        d_backend = decode_summary_df["backend"]
-        d_version = decode_summary_df["version"]
-        d_system = decode_summary_df["system"]
-
-        return pd.DataFrame(
-            [
-                [
-                    model_name,
-                    isl,
-                    osl,
-                    prefix,
-                    concurrency,
-                    request_rate,
-                    p_bs,
-                    p_global_bs,
-                    p_workers,
-                    d_bs,
-                    d_global_bs,
-                    d_workers,
-                    ttft,
-                    tpot,
-                    seq_s,
-                    seq_s_gpu,
-                    tokens_s,
-                    tokens_s_gpu,
-                    tokens_s_user,
-                    p_seq_s_worker,
-                    d_seq_s_worker,
-                    num_total_gpus,
-                    p_tp,
-                    p_pp,
-                    p_dp,
-                    p_moe_tp,
-                    p_moe_ep,
-                    p_parallel,
-                    p_gemm,
-                    p_kvcache,
-                    p_fmha,
-                    p_moe,
-                    p_comm,
-                    p_memory,
-                    p_backend,
-                    p_version,
-                    p_system,
-                    d_tp,
-                    d_pp,
-                    d_dp,
-                    d_moe_tp,
-                    d_moe_ep,
-                    d_parallel,
-                    d_gemm,
-                    d_kvcache,
-                    d_fmha,
-                    d_moe,
-                    d_comm,
-                    d_memory,
-                    d_backend,
-                    d_version,
-                    d_system,
-                ]
-            ],
-            columns=common.ColumnsDisagg,
-        ).round(3)
+        summary_dict = self._get_disagg_summary_dict(prefill_dict, prefill_num_worker, decode_dict, decode_num_worker)
+        return pd.DataFrame([summary_dict], columns=common.ColumnsDisagg).round(3)
 
     def run_disagg(
         self,
@@ -406,14 +404,15 @@ class DisaggInferenceSession:
                 possible disagg config and perf that matches SLA.
         """
 
+        # minor perf optimization: convert num_gpu_list to a set to speed up lookup
+        num_gpu_set = set[int](num_gpu_list) if num_gpu_list else set()
+
+        @functools.lru_cache(maxsize=8192)
         def _match_workers(
             prefill_throughput: float,
             prefill_gpus: int,
             decode_throughput: float,
             decode_gpus: int,
-            prefill_num_worker_list: list[int],
-            decode_num_worker_list: list[int],
-            num_gpu_list: list[int] | None,
             rate_matching_prefill_degradation_factor: float,
             rate_matching_decode_degradation_factor: float,
         ) -> tuple[int, int]:
@@ -422,8 +421,6 @@ class DisaggInferenceSession:
             """
             prefill_opt_num_worker, decode_opt_num_worker = -1, -1
             throughput_per_gpu_max = 0
-            # minor perf optimization: convert num_gpu_list to a set to speed up lookup
-            num_gpu_set = set(num_gpu_list) if num_gpu_list is not None else None
             for decode_num_worker in decode_num_worker_list:
                 for prefill_num_worker in prefill_num_worker_list: #num instances
                     num_gpu = prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker #total_num_gpu
@@ -467,6 +464,7 @@ class DisaggInferenceSession:
             Get all worker candidates based on give search space
             """
             summary_df = pd.DataFrame(columns=common.ColumnsStatic)
+            exceptions = []
 
             for parallel_config in parallel_config_list:
                 tp_size, pp_size, dp_size, moe_tp_size, moe_ep_size = parallel_config
@@ -516,13 +514,18 @@ class DisaggInferenceSession:
                             )
                         else:  # larger b will always OOM
                             break
-                except Exception:
+                except Exception as e:
                     logger.exception(
                         f"Error getting candidate workers with parallel config: "
                         f"tp={tp_size}, pp={pp_size}, dp={dp_size}, moe_tp={moe_tp_size}, "
                         f"moe_ep={moe_ep_size}; skipping this combination"
                     )
+                    exceptions.append(e)
                     continue
+            if summary_df.empty:
+                raise RuntimeError(
+                    f"No results found for any parallel configuration. Showing last exception: {exceptions[-1]}"
+                ) from exceptions[-1]
             return summary_df
 
         def _find_best_result_under_constraints(
@@ -561,9 +564,9 @@ class DisaggInferenceSession:
             correction_factor = 1.8  # let's make it simple for now.
             prefill_candidates = prefill_summary_df.assign(ttft=prefill_summary_df["ttft"] * correction_factor)
 
-            prefill_candidates = prefill_candidates[prefill_candidates["context_latency"] < ttft]
+            prefill_candidates = prefill_candidates[prefill_candidates["ttft"] < ttft]
             if len(prefill_candidates) == 0:
-                logger.debug(f"No prefill worker candidates found for ttft {ttft}ms.")
+                logger.warning(f"No prefill worker candidates found for ttft {ttft}ms.")
                 return None
             prefill_candidates = (
                 prefill_candidates.sort_values(by=["seq/s/gpu", "global_bs"], ascending=[False, True])
@@ -576,59 +579,55 @@ class DisaggInferenceSession:
                 & (decode_summary_df["tpot"] > tpot * DECODE_FILTER_RATIO_MIN)
             ].copy()
             if len(decode_candidates) == 0:
-                logger.debug(f"No decode worker candidates found for tpot {tpot}ms.")
+                logger.warning(f"No decode worker candidates found for tpot {tpot}ms.")
                 return None
 
-            disagg_summary_df_list: list[pd.DataFrame] = []
+            all_category_results: list[dict] = []
+            prefill_candidates_list = prefill_candidates.to_dict("records")
+
             for parallel_value, parallel_group in decode_candidates.groupby("parallel"):
                 parallel_group_sorted = (
                     parallel_group.sort_values(by=["seq/s/gpu"], ascending=[False])
                     .reset_index(drop=True)
                     .head(MAX_DECODE_WORKERS_PER_CATEGORY)
                 )
-                category_results: list[pd.DataFrame] = []
-                for _, decode_worker in parallel_group_sorted.iterrows():
+
+                decode_workers_list = parallel_group_sorted.to_dict("records")
+                category_results: list[dict] = []
+                for decode_worker in decode_workers_list:
                     decode_throughput = float(decode_worker["seq/s"])
                     decode_gpus = decode_worker["num_total_gpus"]
-                    for _, prefill_worker in prefill_candidates.iterrows():
+                    for prefill_worker in prefill_candidates_list:
                         prefill_throughput = float(prefill_worker["seq/s"])
                         prefill_gpus = prefill_worker["num_total_gpus"]
                         prefill_num_worker, decode_num_worker = _match_workers(
                             prefill_throughput=prefill_throughput,
                             prefill_gpus=prefill_gpus, #parallellism
                             decode_throughput=decode_throughput,
-                            decode_gpus=decode_gpus, #parallelism
-                            prefill_num_worker_list=prefill_num_worker_list,
-                            decode_num_worker_list=decode_num_worker_list,
-                            num_gpu_list=num_gpu_list,
+                            decode_gpus=decode_gpus,
                             rate_matching_prefill_degradation_factor=rate_matching_prefill_degradation_factor,
                             rate_matching_decode_degradation_factor=rate_matching_decode_degradation_factor,
                         )
                         if prefill_num_worker == -1 or decode_num_worker == -1:
                             continue
 
-                        disagg_df = self._get_disagg_summary_df(
+                        disagg_dict = self._get_disagg_summary_dict(
                             prefill_worker, prefill_num_worker, decode_worker, decode_num_worker
                         )
-                        category_results.append(disagg_df)
+                        category_results.append(disagg_dict)
 
                 if category_results:
-                    category_df = pd.concat(category_results, ignore_index=True)
                     # only return the best one for each category
-                    category_df = (
-                        category_df.sort_values(by=["tokens/s/gpu", "num_total_gpus"], ascending=[False, True])
-                        .head(1)
-                        .reset_index(drop=True)
-                    )
-                    disagg_summary_df_list.append(category_df)
+                    best_result = max(category_results, key=lambda x: (x["tokens/s/gpu"], -x["num_total_gpus"]))
+                    all_category_results.append(best_result)
                 else:
                     logger.debug(f"No matched result for decode parallel {parallel_value}.")
 
-            if not disagg_summary_df_list:
+            if not all_category_results:
                 logger.debug("No disagg summary found after applying constraints.")
                 return None
 
-            disagg_summary_df = pd.concat(disagg_summary_df_list, ignore_index=True)
+            disagg_summary_df = pd.DataFrame(all_category_results, columns=common.ColumnsDisagg).round(3)
             disagg_summary_df = (
                 disagg_summary_df.sort_values(by=["tokens/s/gpu"], ascending=[False])
                 .head(return_top_k)
@@ -683,13 +682,31 @@ class DisaggInferenceSession:
             return disagg_summary
 
         # find best result under constraints
-        ttft = runtime_config.ttft
-        tpot_list = runtime_config.tpot if isinstance(runtime_config.tpot, list) else [runtime_config.tpot]
-        for tpot in tpot_list:
-            logger.debug(f"Finding best result under constraints for tpot={tpot}ms...")
+        constraint_pairs: list[tuple[float, float]] = []
+        if runtime_config.request_latency is not None and runtime_config.request_latency > 0:
+            constraint_pairs = enumerate_ttft_tpot_constraints(
+                runtime_config.osl,
+                runtime_config.request_latency,
+                runtime_config.ttft,
+            )
+            if not constraint_pairs:
+                logger.debug(
+                    "No ttft/tpot constraints derived for request_latency=%s in disagg optimization.",
+                    runtime_config.request_latency,
+                )
+        else:
+            tpot_values = runtime_config.tpot if isinstance(runtime_config.tpot, list) else [runtime_config.tpot]
+            constraint_pairs = [(runtime_config.ttft, tpot) for tpot in tpot_values]
+
+        for ttft_constraint, tpot_constraint in constraint_pairs:
+            logger.debug(
+                "Finding best result under constraints for ttft=%sms, tpot=%sms...",
+                ttft_constraint,
+                tpot_constraint,
+            )
             filtered_disagg_summary_df = _find_best_result_under_constraints(
-                ttft=ttft,
-                tpot=tpot,
+                ttft=ttft_constraint,
+                tpot=tpot_constraint,
                 prefill_summary_df=prefill_summary_df,
                 decode_summary_df=decode_summary_df,
                 return_top_k=5,
@@ -705,6 +722,7 @@ class DisaggInferenceSession:
             logger.debug(f"No disagg result found for {model_name} with given constraints.")
             return disagg_summary
 
+        disagg_summary_df = disagg_summary_df.drop_duplicates(ignore_index=True)
         # set final disagg summary
         disagg_summary.set_summary_df(disagg_summary_df)
         return disagg_summary

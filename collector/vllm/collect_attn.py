@@ -5,22 +5,41 @@
 import os
 
 import torch
+
+try:
+    from vllm.attention.backends.registry import AttentionBackendEnum
+except ImportError:
+    AttentionBackendEnum = None  # type: ignore
+try:
+    from vllm.platforms import _Backend as LegacyBackendEnum  # type: ignore
+except Exception:
+    LegacyBackendEnum = None  # type: ignore
 from vllm.platforms import current_platform
-from vllm.utils import is_torch_equal_or_newer
+
+try:
+    from vllm.utils import is_torch_equal_or_newer
+except ImportError:
+    from vllm.utils.torch_utils import is_torch_equal_or_newer
+
 from vllm.v1.attention.backends.utils import set_kv_cache_layout
 from vllm.version import __version__ as vllm_version
 
+try:
+    from vllm.utils import resolve_obj_by_qualname
+except ImportError:
+    from vllm.utils.import_utils import resolve_obj_by_qualname  # type: ignore
+
 from collector.vllm.utils import (
     BatchSpec,
-    _Backend,
     create_and_prepopulate_kv_cache,
     create_common_attn_metadata,
     create_standard_kv_cache_spec,
     create_vllm_config,
     get_attention_backend,
-    resolve_obj_by_qualname,
 )
-from helper import get_sm_version, log_perf
+from helper import benchmark_with_power, get_sm_version, log_perf
+
+compatible_version = ["0.11.0", "0.12.0"]
 
 
 class MockAttentionLayer:
@@ -35,6 +54,8 @@ class MockAttentionLayer:
         self._k_scale_float = 1.0
         self._v_scale_float = 1.0
 
+
+compatible_versions = ["0.11.0", "0.12.0"]
 
 # https://github.com/vllm-project/vllm/tree/main/vllm/v1/attention/backends
 # support MHA GQA MQA fp16 tensor and float16/fp8 kv cache
@@ -57,19 +78,55 @@ def run_attention_torch(
     model = os.path.join(os.path.dirname(__file__), "fake_hf_model")
     block_size = 64
 
-    # Let vllm choose the backend.
-    backend = current_platform.get_attn_backend_cls(
-        None,
-        head_dim,
-        dtype,
-        kv_cache_dtype="fp8" if use_fp8_kv_cache else None,
-        block_size=block_size,
-        use_v1=True,
-        use_mla=False,
-        has_sink=False,
-        use_sparse=False,
-    )
-    backend_name = _Backend[resolve_obj_by_qualname(backend).get_name()]
+    # Let vLLM choose the backend. Handle multiple historical signatures:
+    # newest: (... use_mm_prefix=..., use_v1=True/False defaulted to True)
+    # mid:    (... use_mm_prefix omitted)
+    # old:    (... use_v1 required, no use_mm_prefix)
+    try:
+        backend = current_platform.get_attn_backend_cls(
+            None,
+            head_dim,
+            dtype,
+            kv_cache_dtype="fp8" if use_fp8_kv_cache else None,
+            block_size=block_size,
+            use_mla=False,
+            has_sink=False,
+            use_sparse=False,
+            use_mm_prefix=False,
+        )
+    except TypeError:
+        try:
+            backend = current_platform.get_attn_backend_cls(
+                None,
+                head_dim,
+                dtype,
+                kv_cache_dtype="fp8" if use_fp8_kv_cache else None,
+                block_size=block_size,
+                use_mla=False,
+                has_sink=False,
+                use_sparse=False,
+            )
+        except TypeError:
+            backend = current_platform.get_attn_backend_cls(
+                None,
+                head_dim,
+                dtype,
+                kv_cache_dtype="fp8" if use_fp8_kv_cache else None,
+                block_size=block_size,
+                use_mla=False,
+                has_sink=False,
+                use_sparse=False,
+                use_v1=True,
+            )
+
+    backend_name_obj = resolve_obj_by_qualname(backend)
+    backend_name_str = backend_name_obj.get_name()
+    if AttentionBackendEnum is not None:
+        backend_name = AttentionBackendEnum[backend_name_str]
+    elif LegacyBackendEnum is not None:
+        backend_name = LegacyBackendEnum[backend_name_str]
+    else:
+        backend_name = backend_name_str
 
     if is_context_phase:
         batch_spec = BatchSpec(
@@ -92,6 +149,11 @@ def run_attention_torch(
     )
 
     kv_cache_spec = create_standard_kv_cache_spec(vllm_config, use_fp8_kv_cache)
+
+    # Ensure the KV cache has enough blocks for all sequences.
+    required_blocks = 1 + sum((s_len + block_size - 1) // block_size for s_len in batch_spec.seq_lens)
+    num_blocks = vllm_config.cache_config.num_gpu_blocks or required_blocks
+    num_blocks = max(num_blocks, required_blocks)
 
     # Generate data and compute SDPA reference output
     all_q_vllm, all_k_vllm, all_v_vllm = [], [], []
@@ -131,13 +193,15 @@ def run_attention_torch(
         head_size=head_dim,
         dtype=current_platform.fp8_dtype() if use_fp8_kv_cache else dtype,
         device=device,
-        num_blocks=vllm_config.cache_config.num_gpu_blocks or 1000,
+        num_blocks=num_blocks,
         common_attn_metadata=common_attn_metadata,
         randomize_blocks=True,
     )
 
     # Fix backend-specific kv cache layout.
-    if backend_name == _Backend.FLASHINFER:
+    backend_name_str = backend_name if isinstance(backend_name, str) else backend_name.name
+
+    if backend_name_str == "FLASHINFER":
         kv_cache = kv_cache.transpose(0, 1)
 
         # For FlashInfer default to HND layout
@@ -147,15 +211,20 @@ def run_attention_torch(
     # Handle special case for FLEX_ATTENTION_SLOW
     actual_backend = backend_name
     use_direct_block_mask = is_torch_equal_or_newer("2.9.0.dev0")
-    if backend_name == "FLEX_ATTENTION_SLOW":
-        actual_backend = _Backend.FLEX_ATTENTION
+    if backend_name_str == "FLEX_ATTENTION_SLOW":
+        if AttentionBackendEnum is not None:
+            actual_backend = AttentionBackendEnum.FLEX_ATTENTION
+        elif LegacyBackendEnum is not None:
+            actual_backend = LegacyBackendEnum.FLEX_ATTENTION
+        else:
+            actual_backend = backend_name
         use_direct_block_mask = False
 
     builder_cls, impl_cls = get_attention_backend(actual_backend)
     layer_names = ["placeholder"]
 
     # Mock flashinfer's get_per_layer_parameters if needed
-    if actual_backend == _Backend.FLASHINFER:
+    if backend_name_str == "FLASHINFER":
         import unittest.mock
 
         from vllm.v1.attention.backends.utils import PerLayerParameters
@@ -182,7 +251,7 @@ def run_attention_torch(
     else:
         # Build metadata
         builder = builder_cls(kv_cache_spec, layer_names, vllm_config, device)
-        if actual_backend == _Backend.FLEX_ATTENTION:
+        if backend_name_str == "FLEX_ATTENTION":
             builder.direct_build = use_direct_block_mask
         attn_metadata = builder.build(
             common_prefix_len=0,
@@ -226,21 +295,17 @@ def run_attention_torch(
             output=output,
         )
 
-    # Warmup
-    for i in range(warm_up):
-        run()
+    # Use benchmark_with_power context manager
+    with benchmark_with_power(
+        device=device,
+        kernel_func=run,
+        num_warmups=warm_up,
+        num_runs=test_ite,
+        repeat_n=1,
+    ) as results:
+        pass
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
-    torch.cuda.synchronize()
-    start_event.record()
-    for i in range(test_ite):
-        run()
-    end_event.record()
-    torch.cuda.synchronize()
-
-    latency = start_event.elapsed_time(end_event) / test_ite
+    latency = results["latency_ms"]
     print(f"attn latency: {latency}")
 
     if is_context_phase:
@@ -254,7 +319,7 @@ def run_attention_torch(
 
     kv_cache_dtype_str = "float16" if not use_fp8_kv_cache else "fp8"
     dtype_str = "float16"
-    kernel_source = f"vllm_{backend_name}".lower()
+    kernel_source = f"vllm_{backend_name_str}".lower()
 
     log_perf(
         item_list=[
@@ -277,6 +342,7 @@ def run_attention_torch(
         op_name=op_name,
         kernel_source=kernel_source,
         perf_filename=perf_filename,
+        power_stats=results["power_stats"],
     )
 
 

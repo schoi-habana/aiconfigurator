@@ -9,6 +9,7 @@ try:
     from cuda import cudart
 except:
     from cuda.bindings import runtime as cudart
+from common_test_cases import get_gemm_common_test_cases
 from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import str_dtype_to_torch
@@ -16,62 +17,20 @@ from tensorrt_llm.layers import Linear
 from tensorrt_llm.quantization.layers import FP8Linear, SmoothQuantLinear, WeightOnlyQuantLinear
 from tensorrt_llm.quantization.mode import QuantMode
 
-from helper import log_perf
+from helper import log_perf, power_monitoring_only
 
 
 def get_gemm_test_cases():
-    x_list = [
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-        48,
-        64,
-        80,
-        96,
-        128,
-        160,
-        192,
-        256,
-        384,
-        512,
-        768,
-        1024,
-        2048,
-        4096,
-        8192,
-    ]
-    nk_list = [
-        128,
-        256,
-        512,
-        1024,
-        1536,
-        2048,
-        2560,
-        3072,
-        3584,
-        4096,
-        5120,
-        7168,
-        8192,
-        10240,
-        12288,
-    ]
-    nk_list_ext = [16384, 65536]  # for coverage and interp purpose
     gemm_list = ["int8_wo", "int4_wo", "sq"]
+    use_plugin = True
+
     test_cases = []
-    for gemm_type in gemm_list:
-        use_plugin = True
-        # x_list_orig+add+ext  <==> nk_list+ext
-        for x in sorted(x_list, reverse=True):
-            for n in sorted(nk_list + nk_list_ext, reverse=True):
-                for k in sorted(nk_list + nk_list_ext, reverse=True):
-                    if n * k == 65536 * 65536:
-                        continue
-                    test_cases.append([gemm_type, use_plugin, x, n, k])
+    for gemm_common_testcase in get_gemm_common_test_cases():
+        x = gemm_common_testcase.x
+        n = gemm_common_testcase.n
+        k = gemm_common_testcase.k
+        for gemm_type in gemm_list:
+            test_cases.append([gemm_type, use_plugin, x, n, k])
 
     return test_cases
 
@@ -105,7 +64,7 @@ class GEMMProfiler(trt.IProfiler):
             self._layer_name = layer_name
             self._latency = ms
 
-    def write_to_file(self):
+    def write_to_file(self, power_stats=None):
         log_perf(
             item_list=[
                 {
@@ -122,6 +81,7 @@ class GEMMProfiler(trt.IProfiler):
             op_name="gemm",
             kernel_source=f"trt_flow_{self._layer_name}",
             perf_filename=self._perf_filename,
+            power_stats=power_stats,
         )
 
 
@@ -227,12 +187,18 @@ def run_gemm(gemm_type, use_plugin, m, n, k, device="cuda:0"):
     # l2_cache_flusher = L2CacheFlusher()
     cudart.cudaProfilerStart()
     x_data = x_data.to(torch.device(device))
-    with TrtRunner(build_engine) as runner:
+
+    # Use power_monitoring_only context manager for TRT profiler pattern
+    with power_monitoring_only(device) as power_monitor, TrtRunner(build_engine) as runner:
         runner.infer(feed_dict={"x": x_data}, check_inputs=False, copy_outputs_to_host=False)
         if use_fp8 and not use_plugin:  # additional warmup for fp8 OOTB
             for i in range(4):
                 runner.infer(feed_dict={"x": x_data}, check_inputs=False, copy_outputs_to_host=False)
         runner.context.profiler = profiler
         runner.infer(feed_dict={"x": x_data}, check_inputs=False, copy_outputs_to_host=False)
+
     cudart.cudaProfilerStop()
-    profiler.write_to_file()
+
+    # Get power stats after monitoring completes
+    power_stats = power_monitor.stop_sampling() if power_monitor else None
+    profiler.write_to_file(power_stats=power_stats)

@@ -41,20 +41,16 @@ license-files = ["LICENSE"]
 requires-python = ">=3.9"
 
 dependencies = [
-    "uv",
-    "fastapi>=0.115.12",
     "jinja2>=3.1.0",
     "matplotlib>=3.9.4",
     "numpy~=1.26.4",
-    "orjson>=3.10.16",
     "pandas>=2.2.3",
     "plotext>=5.3.2",
     "plotly>=6.0.1",
     "prettytable>=3.16.0",
-    "pydantic~=2.11.4",
     "pyyaml>=6.0",
     "scipy>=1.13.1",
-    "uvicorn>=0.34.2",
+    "tqdm>=4.0.0",
     "bokeh",
     "nvidia-ml-py",
     "munch>=4.0.0"
@@ -62,6 +58,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "uv",
     "ruff==0.14.1",
     "pre-commit==4.3.0",
     "pytest>=8.3.5",
@@ -75,6 +72,11 @@ dev = [
 ]
 webapp = [
     "gradio==5.47.1"
+]
+service = [
+    "fastapi>=0.115.12",
+    "orjson>=3.10.16",
+    "uvicorn>=0.34.2"
 ]
 
 [project.urls]
@@ -90,8 +92,9 @@ aiconfigurator = "aiconfigurator.main:main"
 
 [tool.setuptools.package-data]
 "aiconfigurator.cli" = ["*.yaml", "exps/*.yaml"]
-"aiconfigurator.generator" = ["*.yaml", "templates/**/*.j2"]
+"aiconfigurator.generator" = ["config/**/*.yaml", "config/backend_templates/**/*.j2", "rule_plugin/*.rule"]
 "aiconfigurator" = ["systems/*.yaml", "systems/**/*.txt", "model_configs/*.json"]
+"aiconfigurator.webapp.components.profiling" = ["styles.css", "js/*.js"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -146,6 +149,8 @@ ignore = [
     "RUF059",  # unpacked variable is never used
     "UP007",  # require using X | Y for type annotations
     "UP045", # require using X | None for type annotations
+    "B019", # forbid using functools.cache on class methods
+    "B023", # Function definition does not bind loop variable
 ]
 
 [tool.ruff.lint.isort]

@@ -100,7 +100,7 @@ def parse(args):
         "--workload_distribution",
         type=str,
         default="uniform",
-        choices=["uniform", "balanced", "mostUnbalanced"],
+        choices=["uniform", "balanced", "mostUnbalanced", "power_law"],
         help="workload for moe models",
     )
     parser.add_argument("--ttft", type=float, default=300, help="SLA requirement: ttft limit (ms)")
@@ -110,6 +110,18 @@ def parse(args):
         type=int,
         default=64,
         help="Agg: ctx_stride, mimicking num_tokens_per_block param in TRT-LLM, defaulted as 64",
+    )
+    parser.add_argument(
+        "--enable_wideep",
+        action="store_true",
+        help="Enable WideEP DeepSeek modeling (only effective when --backend sglang and model is DeepSeek).",
+    )
+    parser.add_argument(
+        "--moe_backend",
+        type=str,
+        default="deepep_moe",
+        choices=["deepep_moe", "none"],
+        help="moe backend",
     )
     args = parser.parse_args(args=args)
 
@@ -130,6 +142,8 @@ def main(args):
         workload_distribution=args.workload_distribution,
         attention_dp_size=args.attention_dp_size,
         overwrite_num_layers=args.overwrite_num_layers,
+        enable_wideep=args.enable_wideep,
+        moe_backend=args.moe_backend,
     )
     runtime_config = config.RuntimeConfig(
         batch_size=args.batch_size,

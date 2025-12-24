@@ -580,7 +580,11 @@ class MOEModel(BaseModel):
         gemm_quant_mode = self.config.gemm_quant_mode
         kvcache_quant_mode = self.config.kvcache_quant_mode
         fmha_quant_mode = self.config.fmha_quant_mode
-        workload_distribution = self.config.workload_distribution + f"_{self._power_law_alpha}"
+        workload_distribution = (
+            self.config.workload_distribution + f"_{self._power_law_alpha}"
+            if self.config.workload_distribution == "power_law"
+            else self.config.workload_distribution
+        )
 
         if self.model_name in ["GPT_OSS_120B", "GPT_OSS_20B"]:
             attn_scale_factor = 2
@@ -715,35 +719,6 @@ class MOEModel(BaseModel):
                     num_kv_heads_per_gpu,
                     kvcache_quant_mode,
                     head_size=self._head_size,
-                ),
-                ops.GEMM(
-                    "generation_proj_gemm",
-                    self._num_layers,
-                    h,
-                    self._num_heads * self._head_size // tp_size,
-                    gemm_quant_mode,
-                ),
-                ops.ElementWise("generation_add_norm_2", self._num_layers, 2 * h, 2 * h, 0.8),
-            ]
-        )
-
-        self.generation_ops.extend(
-            [
-                ops.Embedding("generation_embedding", 1, self._vocab_size, h, 0.3),
-                ops.ElementWise("generation_add_norm_1", self._num_layers, 2 * h, 2 * h, 0.8),
-                ops.GEMM(
-                    "generation_qkv_gemm",
-                    self._num_layers,
-                    self._num_heads * self._head_size // tp_size + self._head_size * num_kv_heads_per_gpu * 2,
-                    h,
-                    gemm_quant_mode,
-                ),
-                ops.GenerationAttention(
-                    "generation_attention",
-                    self._num_layers,
-                    self._num_heads // tp_size,
-                    num_kv_heads_per_gpu,
-                    kvcache_quant_mode,
                 ),
                 ops.GEMM(
                     "generation_proj_gemm",
@@ -896,7 +871,11 @@ class DeepSeekModel(BaseModel):
 
         kvcache_quant_mode = self.config.kvcache_quant_mode
         fmha_quant_mode = self.config.fmha_quant_mode
-        workload_distribution = self.config.workload_distribution + f"_{self._power_law_alpha}"
+        workload_distribution = (
+            self.config.workload_distribution + f"_{self._power_law_alpha}"
+            if self.config.workload_distribution == "power_law"
+            else self.config.workload_distribution
+        )
 
         self.context_ops.extend(
             [
@@ -1264,17 +1243,36 @@ class WideEPDeepSeekModel(BaseModel):
         kvcache_quant_mode = self.config.kvcache_quant_mode
         fmha_quant_mode = self.config.fmha_quant_mode
         moe_quant_mode = self.config.moe_quant_mode
+        gemm_quant_mode = self.config.gemm_quant_mode
         moe_backend = self.config.moe_backend
         attn_backend = self.config.attention_backend
 
-        self._power_law_alpha = 0.8
-        workload_distribution = self.config.workload_distribution + f"_{self._power_law_alpha}"
+        self._power_law_alpha = 1.01
+        workload_distribution = (
+            self.config.workload_distribution + f"_{self._power_law_alpha}"
+            if self.config.workload_distribution == "power_law"
+            else self.config.workload_distribution
+        )
 
         sms = self.config.sms
 
         # context mla attention
         self.context_ops.extend(
             [
+                *(
+                    [
+                        ops.NCCL(
+                            "context_tp_all_gather",
+                            self._num_layers,
+                            "all_gather",
+                            h,
+                            tp_size,
+                            common.CommQuantMode.half,
+                        )
+                    ]
+                    if tp_size > 1
+                    else []
+                ),
                 ops.WideEPContextMLA(
                     "context_attention",
                     self._num_layers,
@@ -1282,20 +1280,52 @@ class WideEPDeepSeekModel(BaseModel):
                     kvcache_quant_mode,
                     fmha_quant_mode,
                     attn_backend,
-                )
+                ),
+                *(
+                    [
+                        ops.NCCL(
+                            "context_tp_reduce_scatter",
+                            self._num_layers,
+                            "reduce_scatter",
+                            h,
+                            tp_size,
+                            common.CommQuantMode.half,
+                        )
+                    ]
+                    if tp_size > 1
+                    else []
+                ),
             ]
         )
 
         # shared expert
+        # TODO: support shared expert TP
         self.context_ops.extend(
             [
-                ops.WideEPMLP(
-                    "context_shared_expert",
+                ops.GEMM(
+                    "context_gate_ffn1_gemm",
+                    self._num_layers,
+                    2 * self._moe_inter_size,
+                    h,
+                    gemm_quant_mode,
+                    scale_num_tokens=tp_size,
+                ),
+                ops.ElementWise(
+                    "context_act_gate",
+                    self._num_layers,
+                    2 * self._moe_inter_size,
+                    self._moe_inter_size,
+                    0.8,
+                    scale_num_tokens=tp_size,
+                ),
+                ops.GEMM(
+                    "context_ffn2_gemm",
                     self._num_layers,
                     h,
                     self._moe_inter_size,
-                    moe_quant_mode,
-                )
+                    gemm_quant_mode,
+                    scale_num_tokens=tp_size,
+                ),
             ]
         )
 
@@ -1332,7 +1362,7 @@ class WideEPDeepSeekModel(BaseModel):
                     moe_tp_size,
                     moe_ep_size,
                     moe_quant_mode,
-                    "uniform",
+                    workload_distribution,
                     attention_dp_size,
                     is_context=True,
                     moe_backend=moe_backend,
@@ -1357,13 +1387,27 @@ class WideEPDeepSeekModel(BaseModel):
         # shared expert
         self.generation_ops.extend(
             [
-                ops.WideEPMLP(
-                    "generation_shared_expert",
+                ops.GEMM(
+                    "generation_gate_ffn1_gemm",
+                    self._num_layers * self._mtp_scale_factor,
+                    2 * self._moe_inter_size,
+                    h,
+                    gemm_quant_mode,
+                ),
+                ops.ElementWise(
+                    "generation_act_gate",
+                    self._num_layers * self._mtp_scale_factor,
+                    2 * self._moe_inter_size,
+                    self._moe_inter_size,
+                    0.8,
+                ),
+                ops.GEMM(
+                    "generation_ffn2_gemm",
                     self._num_layers * self._mtp_scale_factor,
                     h,
                     self._moe_inter_size,
-                    moe_quant_mode,
-                )
+                    gemm_quant_mode,
+                ),
             ]
         )
 
